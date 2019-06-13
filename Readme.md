@@ -7,7 +7,7 @@ Imagine having 100 VPS servers and being able to run a daily task to backup ever
 
 Parameters to the application are a command file and a root path to backup to.
 
-When running for the first time, a user and password is requested and stored in a protected data file for the current user. Subsequent runs will detect the file and use the user name and password automatically. Plain text passwords are avoided.
+When running for the first time, a user and password is requested and stored in a protected data file for the current user. Subsequent runs will detect the file and use the user name and password automatically. Plain text passwords are avoided. This file is saved in the root backup folder.
 
 It is assumed that the user and password exists on all the hosts specified, this requires you to use the same user name and password on all machines, so make sure the user name is not root and the password is complex.
 
