@@ -27,6 +27,7 @@ namespace AutoSSH
         {
             public string Host { get; set; }
             public string Name { get; set; }
+            public bool IsWindows { get; set; }
 
             public override string ToString()
             {
@@ -122,17 +123,19 @@ namespace AutoSSH
                 if (isHostLine)
                 {
                     string[] pieces = cleanedLine.Split(' ');
-                    if (pieces.Length != 3)
+                    if (pieces.Length < 3)
                     {
                         throw new InvalidOperationException("Host line format is $host name dns_or_address, line: " + lineIndex);
                     }
                     if (pieces[1] == "*" && pieces[2] == "*")
                     {
                         currentEntry = new HostEntry { Name = "*", Host = "*" };
+                        inheritedLines.Clear();
                     }
                     else
                     {
-                        currentEntry = new HostEntry { Name = pieces[1], Host = pieces[2] };
+                        currentEntry = new HostEntry { Name = pieces[1], Host = pieces[2],
+                            IsWindows = (pieces.Length < 4 ? false : pieces[3].Equals("windows", StringComparison.OrdinalIgnoreCase)) };
                     }
                 }
                 else if (cleanedLine.Length != 0)
@@ -262,13 +265,17 @@ namespace AutoSSH
             return (Math.Sign(byteCount) * num).ToString() + suf[place];
         }
 
-        private static long BackupFile(string root, string path, SftpClient client)
+        private static long BackupFile(string root, string remotePath, SftpClient client)
         {
-            string name = Path.GetFileName(path);
-            string fileName = Path.Combine(root, path.Trim('/', '\\'));
+            string name = Path.GetFileName(remotePath);
+
+            // trim rooted paths, including drive letters
+            string localPath = Regex.Replace(remotePath, @"^\/[A-Za-z]\:[/\\]", string.Empty).Trim('/', '\\');
+            string fileName = Path.Combine(root, localPath);
+
             try
             {
-                SftpFile file = client.Get(path);
+                SftpFile file = client.Get(remotePath);
                 Directory.CreateDirectory(Path.GetDirectoryName(fileName));
                 if (!File.Exists(fileName) || file.LastWriteTimeUtc > File.GetLastWriteTimeUtc(fileName))
                 {
@@ -276,7 +283,7 @@ namespace AutoSSH
                     using (FileStream stream = File.Create(tempFile))
                     {
                         long prevProgress = 0;
-                        client.DownloadFile(path, stream, (progress) =>
+                        client.DownloadFile(remotePath, stream, (progress) =>
                         {
                             Interlocked.Add(ref bytesDownloaded, ((long)progress - prevProgress));
                             prevProgress = (long)progress;
@@ -362,18 +369,29 @@ namespace AutoSSH
             using (ShellStream stream = client.CreateShellStream("xterm", 255, 50, 800, 600, 1024, null))
             using (SftpClient sftpClient = Connect<SftpClient>(root, host))
             {
-                stream.Expect(promptRegex);
-                while (stream.DataAvailable)
+                if (host.IsWindows)
                 {
-                    writer.Write(stream.Read());
+                    stream.Expect(">");
+                    while (stream.DataAvailable)
+                    {
+                        writer.Write(stream.Read());
+                    }
                 }
-                stream.Write("sudo -s\n");
-                stream.Expect("password");
-                WriteSecure(password, stream);
-                stream.Expect("#");
-                while (stream.DataAvailable)
+                else
                 {
-                    writer.Write(stream.Read());
+                    stream.Expect(promptRegex);
+                    while (stream.DataAvailable)
+                    {
+                        writer.Write(stream.Read());
+                    }
+                    stream.Write("sudo -s\n");
+                    stream.Expect("password");
+                    WriteSecure(password, stream);
+                    stream.Expect("#");
+                    while (stream.DataAvailable)
+                    {
+                        writer.Write(stream.Read());
+                    }
                 }
                 foreach (string command in commands)
                 {
@@ -390,7 +408,14 @@ namespace AutoSSH
                         Console.WriteLine("Execute command {0}", command);
                         stream.Write(command);
                         stream.Write("\n");
-                        stream.Expect("#");
+                        if (host.IsWindows)
+                        {
+                            stream.Expect(">");
+                        }
+                        else
+                        {
+                            stream.Expect("#");
+                        }
                         while (stream.DataAvailable)
                         {
                             writer.Write(stream.Read());

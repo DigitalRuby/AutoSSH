@@ -13,7 +13,7 @@ It is assumed that the user and password exists on all the hosts specified, this
 
 Example usage: `dotnet AutoSSH /backup/commands.txt /backup`
 
-The hosts/servers to connect to must be Linux, Windows is not supported. All commands assume sudo for the given login and password.
+The hosts/servers to connect to can be Linux or Windows. All commands assume sudo/administrator for the given login and password.
 
 Command file format is as follows:
 
@@ -35,6 +35,14 @@ $host hostname hostaddress
 
 # multiple hosts are allowed
 $host hostname2 hostaddress2
+
+# clear global host
+$host * *
+
+# add Windows for Windows hosts to ensure correct behavior
+$host hostname3 hostaddress3 Windows
+$backup /C:/Backup/File.txt|/C:/Backup2/File2.txt
+
 ```
 
 For $backup commands, the first run will be slow and backup everything. Subsequent runs will check the last write time UTC timestamp of files and compare to the local files before downloading.
