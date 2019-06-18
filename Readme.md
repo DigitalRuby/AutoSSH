@@ -1,7 +1,7 @@
 ﻿# AutoSSH
 #### Simple SSH automation and backup with dotnet core.
 
-AutoSSH is a simple dotnet core application to run automated commands and/or backup Linux over SSH. This is useful for a central control application where all the logic for automated scripts and backup can be controlled from one place.
+AutoSSH is a simple dotnet core application to run automated commands and/or backup Windows and Linux over SSH. This is useful for a central control application where all the logic for automated scripts and backup can be controlled from one place.
 
 Imagine having 100 VPS servers and being able to run a daily task to backup everything on every server to a central server, which then uses backblaze or another service to backup.
 
