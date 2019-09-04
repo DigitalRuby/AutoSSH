@@ -28,6 +28,7 @@ namespace AutoSSH
             public string Host { get; set; }
             public string Name { get; set; }
             public bool IsWindows { get; set; }
+            public Regex IgnoreRegex { get; set; }
 
             public override string ToString()
             {
@@ -320,7 +321,7 @@ namespace AutoSSH
             return 0;
         }
 
-        private static long BackupFolder(string root, string path, SftpClient client)
+        private static long BackupFolder(HostEntry host, string root, string path, SftpClient client)
         {
             long size = 0;
             foreach (string fileOrFolder in path.Split('|').Select(s => s.Trim()).Where(s => s.Length != 0))
@@ -341,13 +342,13 @@ namespace AutoSSH
                 else
                 {
                     SftpFile[] files = client.ListDirectory(fileOrFolder).Where(f => f.IsRegularFile || (f.IsDirectory && !f.Name.StartsWith("."))).ToArray();
-                    Parallel.ForEach(files.Where(f => f.IsRegularFile), parallelOptions, (_file) =>
+                    Parallel.ForEach(files.Where(f => f.IsRegularFile && (host.IgnoreRegex == null || !host.IgnoreRegex.IsMatch(f.FullName))), parallelOptions, (_file) =>
                     {
                         Interlocked.Add(ref size, BackupFile(root, _file.FullName, client));
                     });
                     Parallel.ForEach(files.Where(f => f.IsDirectory), parallelOptions2, (folder) =>
                     {
-                        Interlocked.Add(ref size, BackupFolder(root, folder.FullName, client));
+                        Interlocked.Add(ref size, BackupFolder(host, root, folder.FullName, client));
                     });
                 }
             }
@@ -400,7 +401,11 @@ namespace AutoSSH
                     {
                         if (command.StartsWith("$backup ", StringComparison.OrdinalIgnoreCase))
                         {
-                            backupSize += BackupFolder(backupPath, command.Substring(8), sftpClient);
+                            backupSize += BackupFolder(host, backupPath, command.Substring(8), sftpClient);
+                        }
+                        else if (command.StartsWith("$ignore ", StringComparison.OrdinalIgnoreCase))
+                        {
+                            host.IgnoreRegex = new Regex(command.Substring(8), RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
                         }
                     }
                     else

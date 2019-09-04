@@ -24,6 +24,10 @@ Command file format is as follows:
 $host * *
 # update packages
 apt-get -q -y update
+
+# ignore files by case insensitive regex, in this case any file called big_files[0-9]+\.bin
+$ignore big_file[0-9]+\.bin
+
 # backup files and folders, always recursive, separate multiple with |
 $backup /var/www|/etc/apache2/apache2.conf|/etc/apache2/sites-enabled
 
