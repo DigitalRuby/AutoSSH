@@ -25,7 +25,7 @@ $host * *
 # update packages
 apt-get -q -y update
 
-# ignore files by case insensitive regex, in this case any file called big_files[0-9]+\.bin
+# ignore files by case insensitive regex, in this case any file called big_file[0-9]+\.bin
 $ignore big_file[0-9]+\.bin
 
 # backup files and folders, always recursive, separate multiple with |
