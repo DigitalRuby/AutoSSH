@@ -321,7 +321,7 @@ namespace AutoSSH
             return 0;
         }
 
-        private static long BackupFolder(HostEntry host, string root, string path, SftpClient client)
+        private static long BackupFolder(HostEntry host, string root, string path, SftpClient client, StreamWriter log)
         {
             long size = 0;
             foreach (string fileOrFolder in path.Split('|').Select(s => s.Trim()).Where(s => s.Length != 0))
@@ -341,15 +341,22 @@ namespace AutoSSH
                 }
                 else
                 {
-                    SftpFile[] files = client.ListDirectory(fileOrFolder).Where(f => f.IsRegularFile || (f.IsDirectory && !f.Name.StartsWith("."))).ToArray();
-                    Parallel.ForEach(files.Where(f => f.IsRegularFile && (host.IgnoreRegex == null || !host.IgnoreRegex.IsMatch(f.FullName))), parallelOptions, (_file) =>
+                    try
                     {
-                        Interlocked.Add(ref size, BackupFile(root, _file.FullName, client));
-                    });
-                    Parallel.ForEach(files.Where(f => f.IsDirectory), parallelOptions2, (folder) =>
+                        SftpFile[] files = client.ListDirectory(fileOrFolder).Where(f => f.IsRegularFile || (f.IsDirectory && !f.Name.StartsWith("."))).ToArray();
+                        Parallel.ForEach(files.Where(f => f.IsRegularFile && (host.IgnoreRegex == null || !host.IgnoreRegex.IsMatch(f.FullName))), parallelOptions, (_file) =>
+                        {
+                            Interlocked.Add(ref size, BackupFile(root, _file.FullName, client));
+                        });
+                        Parallel.ForEach(files.Where(f => f.IsDirectory), parallelOptions2, (folder) =>
+                        {
+                            Interlocked.Add(ref size, BackupFolder(host, root, folder.FullName, client, log));
+                        });
+                    }
+                    catch (Exception ex)
                     {
-                        Interlocked.Add(ref size, BackupFolder(host, root, folder.FullName, client));
-                    });
+                        log.WriteLine("Failed to backup file or folder {0}, error: {1}", fileOrFolder, ex.Message);
+                    }
                 }
             }
             return size;
@@ -401,7 +408,7 @@ namespace AutoSSH
                     {
                         if (command.StartsWith("$backup ", StringComparison.OrdinalIgnoreCase))
                         {
-                            backupSize += BackupFolder(host, backupPath, command.Substring(8), sftpClient);
+                            backupSize += BackupFolder(host, backupPath, command.Substring(8), sftpClient, writer);
                         }
                         else if (command.StartsWith("$ignore ", StringComparison.OrdinalIgnoreCase))
                         {
