@@ -335,6 +335,11 @@ namespace AutoSSH
                 {
                     continue;
                 }
+                catch (Exception ex)
+                {
+                    log.WriteLine("Error backing up folder {0}: {1}", fileOrFolder, ex);
+                    continue;
+                }
                 if (file.IsRegularFile)
                 {
                     Interlocked.Add(ref size, BackupFile(root, file.FullName, client));
