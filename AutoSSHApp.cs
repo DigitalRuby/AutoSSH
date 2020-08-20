@@ -353,7 +353,7 @@ namespace AutoSSH
                         {
                             Interlocked.Add(ref size, BackupFile(root, _file.FullName, client));
                         });
-                        Parallel.ForEach(files.Where(f => f.IsDirectory), parallelOptions2, (folder) =>
+                        Parallel.ForEach(files.Where(f => f.IsDirectory && (host.IgnoreRegex == null || !host.IgnoreRegex.IsMatch(f.FullName))), parallelOptions2, (folder) =>
                         {
                             Interlocked.Add(ref size, BackupFolder(host, root, folder.FullName, client, log));
                         });
