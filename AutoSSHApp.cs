@@ -465,7 +465,14 @@ namespace AutoSSH
             updateTimer.Change(1, 100);
             Parallel.ForEach(commands, (kv) =>
             {
-                ClientLoop(backupFolder, kv.Key, kv.Value);
+                try
+                {
+                    ClientLoop(backupFolder, kv.Key, kv.Value);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Error on host {0}: {1}", kv.Key.Host, ex);
+                }
             });
             Console.WriteLine("Bytes downloaded: {0}, skipped: {1}    ", BytesToString(bytesDownloaded), BytesToString(bytesSkipped));
             Console.WriteLine("Process completed at {0}, total time: {1:0.00} minutes.", DateTime.Now, stopWatch.Elapsed.TotalMinutes);
