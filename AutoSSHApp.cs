@@ -277,10 +277,11 @@ namespace AutoSSH
             try
             {
                 SftpFile file = client.Get(remotePath);
-                Directory.CreateDirectory(Path.GetDirectoryName(fileName));
-                if (!File.Exists(fileName) || file.LastWriteTimeUtc > File.GetLastWriteTimeUtc(fileName))
+                if (file.IsRegularFile && 
+                    (!File.Exists(fileName) || file.LastWriteTimeUtc > File.GetLastWriteTimeUtc(fileName)))
                 {
                     string tempFile = fileName + ".__TEMP__";
+                    Directory.CreateDirectory(Path.GetDirectoryName(fileName));
                     using (FileStream stream = File.Create(tempFile))
                     {
                         long prevProgress = 0;
@@ -326,6 +327,10 @@ namespace AutoSSH
             long size = 0;
             foreach (string fileOrFolder in path.Split('|').Select(s => s.Trim()).Where(s => s.Length != 0))
             {
+                if (!client.Exists(fileOrFolder))
+                {
+                    continue;
+                }
                 SftpFile file;
                 try
                 {
@@ -471,7 +476,7 @@ namespace AutoSSH
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine("Error on host {0}: {1}", kv.Key.Host, ex);
+                    Console.WriteLine("Error on host {0}: {1}\r\n", kv.Key.Host, ex);
                 }
             });
             Console.WriteLine("Bytes downloaded: {0}, skipped: {1}    ", BytesToString(bytesDownloaded), BytesToString(bytesSkipped));
