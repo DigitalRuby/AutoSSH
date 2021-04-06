@@ -16,6 +16,7 @@ using System.Threading;
 using Renci.SshNet;
 using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
+using System.Buffers;
 
 #endregion Imports
 
@@ -267,6 +268,30 @@ namespace AutoSSH
             return (Math.Sign(byteCount) * num).ToString() + suf[place];
         }
 
+        private static void CopyTo(this Stream source, Stream destination, Action<ulong> progress = null)
+        {
+            ulong totalBytes = 0;
+            var buffer = ArrayPool<byte>.Shared.Rent(ushort.MaxValue);
+            try
+            {
+                int read;
+                while ((read = source.Read(buffer, 0, buffer.Length)) != 0)
+                {
+                    if (progress != null)
+                    {
+                        totalBytes += (ulong)read;
+                        progress(totalBytes);
+                    }
+
+                    destination.Write(buffer, 0, read);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
         private static long BackupFile(string root, string remotePath, SftpClient client)
         {
             string name = Path.GetFileName(remotePath);
@@ -394,13 +419,14 @@ namespace AutoSSH
 
                 try
                 {
-                    using var stream = File.OpenRead(file);
+                    long prevProgress = 0;
+                    using var localStream = File.OpenRead(file);
                     if (!client.Exists(remoteDir))
                     {
                         client.CreateDirectory(remoteDir);
                     }
-                    long prevProgress = 0;
-                    client.UploadFile(stream, remoteFile, bytesUploaded =>
+                    using var remoteStream = client.OpenWrite(remoteFile);
+                    localStream.CopyTo(remoteStream, bytesUploaded =>
                     {
                         Interlocked.Add(ref AutoSSHApp.bytesUploaded, ((long)bytesUploaded - prevProgress));
                         prevProgress = (long)bytesUploaded;
