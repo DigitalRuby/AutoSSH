@@ -31,6 +31,9 @@ $ignore big_file[0-9]+\.bin
 # backup files and folders, always recursive, separate multiple with |
 $backup /var/www|/etc/apache2/apache2.conf|/etc/apache2/sites-enabled
 
+# upload files and folders, always recursive, separate local and remote path with a ;
+$upload c:/files/newfiles;/home/user/newfiles
+
 # hosts have a name and an address/dns name
 # when backing up, the hostname will be used for the folder name inside the root backup folder.
 $host hostname hostaddress

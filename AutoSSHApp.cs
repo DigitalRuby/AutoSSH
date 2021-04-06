@@ -41,6 +41,7 @@ namespace AutoSSH
         private static SecureString userName;
         private static SecureString password;
         private static long bytesDownloaded;
+        private static long bytesUploaded;
         private static long bytesSkipped;
 
         private static void WriteSecure(SecureString secureString, ShellStream writer)
@@ -164,9 +165,9 @@ namespace AutoSSH
             return commands;
         }
 
-        private static List<KeyValuePair<HostEntry, List<string>>> Initialize(string commandFile, string root)
+        private static List<KeyValuePair<HostEntry, List<string>>> Initialize(string commandFile, string backupRoot)
         {
-            string loginPath = Path.Combine(root, "login.key");
+            string loginPath = Path.Combine(backupRoot, "login.key");
             if (!File.Exists(loginPath))
             {
                 Console.Write("Enter user name: ");
@@ -372,12 +373,47 @@ namespace AutoSSH
             return size;
         }
 
+        private static long UploadFolder(HostEntry host, string pathInfo, SftpClient client, StreamWriter log)
+        {
+            long uploadSize = 0;
+            string[] paths = pathInfo.Split(';');
+            string localDir = paths[0];
+            string remoteFolder = paths[1];
+            string[] localFiles = Directory.GetFiles(localDir, "*", SearchOption.AllDirectories);
+            Parallel.ForEach(localFiles, file =>
+            {
+                if (host.IgnoreRegex != null && host.IgnoreRegex.IsMatch(file))
+                {
+                    return;
+                }
+
+                using var stream = File.OpenRead(file);
+                var localDirForFile = Path.GetDirectoryName(file);
+                var localFile = Path.GetFileName(file);
+                var remoteDir = Path.Combine(remoteFolder, localDirForFile.Substring(localDir.Length));
+                var remoteFile = remoteDir + "/" + localFile;
+                if (!client.Exists(remoteDir))
+                {
+                    client.CreateDirectory(remoteDir);
+                }
+                long prevProgress = 0;
+                client.UploadFile(stream, remoteFile, bytesUploaded =>
+                {
+                    Interlocked.Add(ref AutoSSHApp.bytesUploaded, ((long)bytesUploaded - prevProgress));
+                    prevProgress = (long)bytesUploaded;
+                });
+                Interlocked.Add(ref uploadSize, prevProgress);
+            });
+            return uploadSize;
+        }
+
         private static void ClientLoop(string root, HostEntry host, List<string> commands)
         {
             bytesDownloaded = 0;
             string logFile = Path.Combine(root, host.Name, "log.txt");
             string backupPath = Path.Combine(root, host.Name, "backup");
             long backupSize = 0;
+            long uploadSize = 0;
             Directory.CreateDirectory(Path.GetDirectoryName(logFile));
             Regex promptRegex = new Regex(@"[$>]");
             //Regex userRegex = new Regex(@"[$>]");
@@ -420,6 +456,10 @@ namespace AutoSSH
                         {
                             backupSize += BackupFolder(host, backupPath, command.Substring(8), sftpClient, writer);
                         }
+                        else if (command.StartsWith("$upload ", StringComparison.OrdinalIgnoreCase))
+                        {
+                            uploadSize += UploadFolder(host, command.Substring(8), sftpClient, writer);
+                        }
                         else if (command.StartsWith("$ignore ", StringComparison.OrdinalIgnoreCase))
                         {
                             host.IgnoreRegex = new Regex(command.Substring(8), RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
@@ -446,7 +486,8 @@ namespace AutoSSH
                 }
                 writer.Write("logout\n");
             }
-            Console.WriteLine("{0} backed up {1}                         ", host, BytesToString(backupSize));
+            Console.WriteLine("{0} backed up {1}                      ", host, BytesToString(backupSize));
+            Console.WriteLine("{0} uploaded {1}                      ", host, BytesToString(uploadSize));
         }
 
         public static void Main(string[] args)
@@ -457,17 +498,20 @@ namespace AutoSSH
             }
 
             Console.WriteLine("Process started at {0}", DateTime.Now);
+            ThreadPool.SetMinThreads(1024, 2048);
+            ThreadPool.SetMaxThreads(16384, 32768);
             Stopwatch stopWatch = Stopwatch.StartNew();
-            string commandFile = args[0];
-            string backupFolder = args[1];
+            string commandFile = args.Length > 0 ? args[0] : null;
+            string backupFolder = args.Length > 1 ? args[1] : null;
             List<KeyValuePair<HostEntry, List<string>>> commands = Initialize(commandFile, backupFolder);
             Timer updateTimer = new Timer(new TimerCallback((state) =>
             {
-                Console.Write("Bytes downloaded: {0}, skipped: {1}    \r", BytesToString(bytesDownloaded), BytesToString(bytesSkipped));
+                Console.Write("Bytes downloaded: {0}, uploaded: {1}, skipped: {2}    \r",
+                    BytesToString(bytesDownloaded), BytesToString(bytesUploaded), BytesToString(bytesSkipped));
             }));
 
-            // 10x second update rate
-            updateTimer.Change(1, 100);
+            // 4x second update rate
+            updateTimer.Change(1, 250);
             Parallel.ForEach(commands, (kv) =>
             {
                 try
@@ -479,7 +523,9 @@ namespace AutoSSH
                     Console.WriteLine("Error on host {0}: {1}\r\n", kv.Key.Host, ex);
                 }
             });
-            Console.WriteLine("Bytes downloaded: {0}, skipped: {1}    ", BytesToString(bytesDownloaded), BytesToString(bytesSkipped));
+            Console.WriteLine("Bytes downloaded: {0}    ", BytesToString(bytesDownloaded));
+            Console.WriteLine("Bytes uploaded: {0}   ", BytesToString(bytesUploaded));
+            Console.WriteLine("Bytes skipped: {0}   ", BytesToString(bytesSkipped));
             Console.WriteLine("Process completed at {0}, total time: {1:0.00} minutes.", DateTime.Now, stopWatch.Elapsed.TotalMinutes);
         }
     }
