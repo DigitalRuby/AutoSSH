@@ -104,14 +104,33 @@ namespace AutoSSH
             string cleanedLine;
             bool isHostLine = false;
             int lineIndex = 0;
+            Dictionary<string, string> replacers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
             foreach (string line in File.ReadAllLines(commandFile))
             {
+                // clean and trim
                 cleanedLine = line.Trim();
                 int pos = cleanedLine.IndexOf('#');
                 if (pos >= 0)
                 {
                     cleanedLine = cleanedLine.Substring(0, pos).Trim();
                 }
+
+                // replace any find and replace directives
+                foreach (var kv in replacers)
+                {
+                    cleanedLine = cleanedLine.Replace(kv.Key, kv.Value, StringComparison.OrdinalIgnoreCase);
+                }
+
+                // look for defines ($...$=value)
+                Match replacer = Regex.Match(cleanedLine, @"(?<name>\$[^\$]+\$)\s*=\s*(?<value>.+)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+                if (replacer.Success)
+                {
+                    replacers[replacer.Groups["name"].Value] = replacer.Groups["value"].Value;
+                    continue;
+                }
+
+                // check if this is a host
                 isHostLine = cleanedLine.StartsWith("$host", StringComparison.OrdinalIgnoreCase);
                 if (currentEntry != null && (cleanedLine.Length == 0 || isHostLine))
                 {
@@ -125,6 +144,7 @@ namespace AutoSSH
                 }
                 if (isHostLine)
                 {
+                    // found a host, set the current entry
                     string[] pieces = cleanedLine.Split(' ');
                     if (pieces.Length < 3)
                     {
@@ -161,6 +181,7 @@ namespace AutoSSH
             lines.AddRange(inheritedLines);
             if (currentEntry != null && lines.Count != 0)
             {
+                // add commands for this host
                 commands.Add(new KeyValuePair<HostEntry, List<string>>(currentEntry, lines));
             }
             return commands;

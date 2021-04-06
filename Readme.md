@@ -25,6 +25,9 @@ $host * *
 # update packages
 apt-get -q -y update
 
+# define replacement
+$NEWFILES$ = newfiles
+
 # ignore files by case insensitive regex, in this case any file called big_file[0-9]+\.bin
 $ignore big_file[0-9]+\.bin
 
@@ -32,7 +35,7 @@ $ignore big_file[0-9]+\.bin
 $backup /var/www|/etc/apache2/apache2.conf|/etc/apache2/sites-enabled
 
 # upload files and folders, always recursive, separate local and remote path with a ;
-$upload c:/files/newfiles;/home/user/newfiles
+$upload c:/files/newfiles;/home/user/$NEWFILES$ # use the macro from above
 
 # hosts have a name and an address/dns name
 # when backing up, the hostname will be used for the folder name inside the root backup folder.
