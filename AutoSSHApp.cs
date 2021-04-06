@@ -387,22 +387,30 @@ namespace AutoSSH
                     return;
                 }
 
-                using var stream = File.OpenRead(file);
                 var localDirForFile = Path.GetDirectoryName(file);
                 var localFile = Path.GetFileName(file);
                 var remoteDir = Path.Combine(remoteFolder, localDirForFile.Substring(localDir.Length));
                 var remoteFile = remoteDir + "/" + localFile;
-                if (!client.Exists(remoteDir))
+
+                try
                 {
-                    client.CreateDirectory(remoteDir);
+                    using var stream = File.OpenRead(file);
+                    if (!client.Exists(remoteDir))
+                    {
+                        client.CreateDirectory(remoteDir);
+                    }
+                    long prevProgress = 0;
+                    client.UploadFile(stream, remoteFile, bytesUploaded =>
+                    {
+                        Interlocked.Add(ref AutoSSHApp.bytesUploaded, ((long)bytesUploaded - prevProgress));
+                        prevProgress = (long)bytesUploaded;
+                    });
+                    Interlocked.Add(ref uploadSize, prevProgress);
                 }
-                long prevProgress = 0;
-                client.UploadFile(stream, remoteFile, bytesUploaded =>
+                catch (Exception ex)
                 {
-                    Interlocked.Add(ref AutoSSHApp.bytesUploaded, ((long)bytesUploaded - prevProgress));
-                    prevProgress = (long)bytesUploaded;
-                });
-                Interlocked.Add(ref uploadSize, prevProgress);
+                    Console.WriteLine("Error uploading file {0} to {1}: {2}", localFiles, remoteFile, ex);
+                }
             });
             return uploadSize;
         }
