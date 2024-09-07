@@ -5,7 +5,7 @@
 		<TargetFramework>net8.0</TargetFramework>
 		<TrimMode>partial</TrimMode>
 		<JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
-		<!-- <PublishAot>true</PublishAot> -->
+		<PublishAot>true</PublishAot>
 	</PropertyGroup>
 
 	<ItemGroup>

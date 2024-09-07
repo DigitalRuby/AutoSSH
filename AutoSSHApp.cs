@@ -37,8 +37,8 @@ namespace AutoSSH
             }
         }
 
-        private static readonly ParallelOptions parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = 16 };
-        private static readonly ParallelOptions parallelOptions2 = new ParallelOptions { MaxDegreeOfParallelism = 4 };
+        private static readonly ParallelOptions parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = 64 };
+        private static readonly ParallelOptions parallelOptions2 = new ParallelOptions { MaxDegreeOfParallelism = 16 };
         private static SecureString userName;
         private static SecureString password;
         private static long bytesDownloaded;
