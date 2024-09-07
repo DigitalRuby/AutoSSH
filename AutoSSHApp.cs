@@ -209,7 +209,8 @@ namespace AutoSSH
                         password += key.KeyChar;
                     }
                 }
-                byte[] bytes = ProtectedData.Protect(Encoding.UTF8.GetBytes(userName + "|" + password), null, DataProtectionScope.CurrentUser);
+                byte[] bytes = ProtectedData.Protect(Encoding.UTF8.GetBytes(userName + "|" + password), null,
+                    DataProtectionScope.CurrentUser);
                 File.WriteAllBytes(loginPath, bytes);
             }
             if (!File.Exists(loginPath))
@@ -218,7 +219,8 @@ namespace AutoSSH
             }
             {
                 byte[] protectedBytes = File.ReadAllBytes(loginPath);
-                string unprotectedBytes = Encoding.UTF8.GetString(ProtectedData.Unprotect(protectedBytes, null, DataProtectionScope.CurrentUser));
+                string unprotectedBytes = Encoding.UTF8.GetString(ProtectedData.Unprotect(protectedBytes, null,
+                    DataProtectionScope.CurrentUser));
                 int pos = unprotectedBytes.IndexOf('|');
                 if (pos < 0)
                 {
@@ -323,7 +325,7 @@ namespace AutoSSH
 
             try
             {
-                SftpFile file = client.Get(remotePath);
+                var file = client.Get(remotePath);
                 if (file.IsRegularFile && 
                     (!File.Exists(fileName) || file.LastWriteTimeUtc > File.GetLastWriteTimeUtc(fileName)))
                 {
@@ -378,7 +380,7 @@ namespace AutoSSH
                 {
                     continue;
                 }
-                SftpFile file;
+                ISftpFile file;
                 try
                 {
                     file = client.Get(fileOrFolder);
@@ -400,7 +402,7 @@ namespace AutoSSH
                 {
                     try
                     {
-                        SftpFile[] files = client.ListDirectory(fileOrFolder).Where(f => f.IsRegularFile || (f.IsDirectory && !f.Name.StartsWith("."))).ToArray();
+                        var files = client.ListDirectory(fileOrFolder).Where(f => f.IsRegularFile || (f.IsDirectory && !f.Name.StartsWith("."))).ToArray();
                         Parallel.ForEach(files.Where(f => f.IsRegularFile && (host.IgnoreRegex == null || !host.IgnoreRegex.IsMatch(f.FullName))), parallelOptions, (_file) =>
                         {
                             Interlocked.Add(ref size, BackupFile(root, _file.FullName, client));
