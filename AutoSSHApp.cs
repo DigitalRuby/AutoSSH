@@ -236,12 +236,12 @@ namespace AutoSSH
             return LoadCommands(commandFile);
         }
 
-        private static T Connect<T>(string root, HostEntry host) where T : BaseClient
+        private static BaseClient Connect(string root, HostEntry host, bool ssh)
         {
-            Console.WriteLine("Connecting to {0} with type {1}", host, typeof(T).Name);
+            Console.WriteLine("Connecting to {0} with type {1}", host, ssh ? "SSH" : "SFTP");
             root = Path.Combine(root, host.Name);
             Directory.CreateDirectory(root);
-            MemoryStream finger = new MemoryStream();
+            MemoryStream finger = new();
             bool hasFinger = false;
             string fingerFile = Path.Combine(root, "finger.key");
             if (File.Exists(fingerFile))
@@ -252,7 +252,9 @@ namespace AutoSSH
                     fs.CopyTo(finger);
                 }
             }
-            T client = Activator.CreateInstance(typeof(T), new object[] { host.Host, SecureStringToString(userName), SecureStringToString(password) }) as T;
+            var insecureUserName = SecureStringToString(userName);
+            var insecurePassword = SecureStringToString(password);
+            BaseClient client = ssh ? new SshClient(host.Host, insecureUserName, insecurePassword) : new SftpClient(host.Host, insecureUserName, insecurePassword);
             bool fingerMatch = true;
             client.HostKeyReceived += (sender, e) =>
             {
@@ -476,9 +478,9 @@ namespace AutoSSH
             //Regex userRegex = new Regex(@"[$>]");
             //Regex passwordRegex = new Regex(@"([$#>:])");
             using (StreamWriter writer = File.CreateText(logFile))
-            using (SshClient client = Connect<SshClient>(root, host))
+            using (SshClient client = (SshClient)Connect(root, host, true))
             using (ShellStream stream = client.CreateShellStream("xterm", 255, 50, 800, 600, 1024, null))
-            using (SftpClient sftpClient = Connect<SftpClient>(root, host))
+            using (SftpClient sftpClient = (SftpClient)Connect(root, host, false))
             {
                 if (host.IsWindows)
                 {
