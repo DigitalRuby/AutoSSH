@@ -11,8 +11,8 @@ Environment.SetEnvironmentVariable("AUTOSSH_COMMAND_TIMEOUT_SECONDS", "1");
 var tests = new (string Name, Action Run)[]
 {
     ("Recursive backups serialize SFTP requests and preserve sync/ignore behavior", BackupTree),
-    ("Parallel backups use independent bounded sessions and skip unchanged files without connections", ParallelBackup),
-    ("Parallel backup failures propagate and dispose worker sessions", ParallelBackupFailure),
+    ("Concurrent task downloads use independent bounded sessions and skip unchanged files without connections", ParallelBackup),
+    ("Concurrent task failures propagate and dispose worker sessions", ParallelBackupFailure),
     ("Failed and incomplete downloads preserve the previous backup", FailedDownload),
     ("Session failures escape every backup stage immediately", BackupSessionFailures),
     ("Uploads retain the remote root, create parents, and truncate existing files", UploadTree),
@@ -50,6 +50,17 @@ static AutoSSHApp.HostEntry Host(string ignore = null) => new()
     Host = "test", Name = "test", IgnoreRegex = ignore == null ? null : new Regex(ignore)
 };
 
+static long BackupFile(string root, string path, ISftpClient client) =>
+    AutoSSHApp.BackupFileAsync(root, path, client).GetAwaiter().GetResult();
+
+static long BackupFolder(AutoSSHApp.HostEntry host, string root, string path, ISftpClient client,
+    TextWriter log, Func<ISftpClient> createClient = null, int workers = 4) =>
+    AutoSSHApp.BackupFolderAsync(host, root, path, client, log,
+        createClient == null ? null : () => Task.FromResult(createClient()), workers).GetAwaiter().GetResult();
+
+static long UploadFolder(AutoSSHApp.HostEntry host, string path, ISftpClient client, TextWriter log) =>
+    AutoSSHApp.UploadFolderAsync(host, path, client, log).GetAwaiter().GetResult();
+
 static void BackupTree()
 {
     using var temp = new TempFolder();
@@ -70,12 +81,12 @@ static void BackupTree()
     remote.AddFile("/data/ignore.txt", "ignore");
     remote.AddDirectory("/data/ignored-dir");
     remote.AddFile("/data/ignored-dir/file", "ignore");
-    long size = AutoSSHApp.BackupFolder(Host("ignore"), temp.Path, "/data", remote.Client, TextWriter.Null);
+    long size = BackupFolder(Host("ignore"), temp.Path, "/data", remote.Client, TextWriter.Null);
     Check(size == expected, "Wrong backup size or missing files.");
     Check(remote.Downloads == 64 && remote.MaxActive == 1, "SFTP operations must not overlap.");
     Check(Directory.GetFiles(temp.Path, "*", SearchOption.AllDirectories).Length == 64, "Ignore rules failed.");
     Check(File.ReadAllText(System.IO.Path.Combine(temp.Path, "data/folder7/file7")) == "contents 7/7", "Wrong contents.");
-    Check(AutoSSHApp.BackupFolder(Host("ignore"), temp.Path, "/data", remote.Client, TextWriter.Null) == expected, "Wrong skipped size.");
+    Check(BackupFolder(Host("ignore"), temp.Path, "/data", remote.Client, TextWriter.Null) == expected, "Wrong skipped size.");
     Check(remote.Downloads == 64, "Unchanged files were downloaded again.");
     Check(remote.Gets == 2 && remote.Listings == 18, "Sync performed redundant metadata requests.");
 
@@ -111,13 +122,13 @@ static void ParallelBackup()
         clients.Add(worker);
         return worker.Client;
     }
-    long size = AutoSSHApp.BackupFolder(Host(), temp.Path, "/data|/data", scanner.Client, TextWriter.Null, Connect, 3);
+    long size = BackupFolder(Host(), temp.Path, "/data|/data", scanner.Client, TextWriter.Null, Connect, 3);
     Check(size == 32 * 8, "Overlapping roots duplicated work or lost files.");
     Check(clients.Count == 3 && clients.Sum(c => c.Downloads) == 32, "Wrong worker bound or download count.");
     Check(clients.All(c => c.MaxActive == 1 && c.Disposals == 1 && c.Gets == 0), "Worker sessions overlap, leak, or repeat metadata requests.");
     Check(scanner.Downloads == 0 && scanner.MaxActive == 1, "Scanner session was shared with downloads.");
     Check(Directory.GetFiles(temp.Path, "*", SearchOption.AllDirectories).All(f => File.ReadAllText(f) == "contents"), "Parallel backup corrupted files.");
-    size = AutoSSHApp.BackupFolder(Host(), temp.Path, "/data", scanner.Client, TextWriter.Null,
+    size = BackupFolder(Host(), temp.Path, "/data", scanner.Client, TextWriter.Null,
         () => throw new InvalidOperationException("Unchanged sync opened a download connection."), 3);
     Check(size == 32 * 8, "Wrong unchanged backup size.");
 }
@@ -134,12 +145,12 @@ static void ParallelBackupFailure()
         clients.Add(worker);
         return worker.Client;
     }
-    Throws<SshOperationTimeoutException>(() => AutoSSHApp.BackupFolder(Host(), temp.Path, "/data",
+    Throws<SshOperationTimeoutException>(() => BackupFolder(Host(), temp.Path, "/data",
         scanner.Client, TextWriter.Null, Connect, 3));
     Check(clients.Count > 0 && clients.Count <= 3, "Unexpected worker count after failure.");
     Check(clients.All(c => c.Disposals == 1 && c.Downloads <= 1), "Failed session reused or not disposed.");
     Check(!Directory.GetFiles(temp.Path, "*.__TEMP__", SearchOption.AllDirectories).Any(), "Failed parallel download left temporary files.");
-    Throws<SshConnectionException>(() => AutoSSHApp.BackupFolder(Host(), temp.Path, "/data",
+    Throws<SshConnectionException>(() => BackupFolder(Host(), temp.Path, "/data",
         scanner.Client, TextWriter.Null, () => throw new SshConnectionException("connect failed"), 3));
 }
 
@@ -156,13 +167,13 @@ static void FailedDownload()
         remote.PartialDownload = true;
         remote.StallDownload = stall;
         if (stall)
-            Throws<SshOperationTimeoutException>(() => AutoSSHApp.BackupFile(temp.Path, "/file", remote.Client));
+            Throws<SshOperationTimeoutException>(() => BackupFile(temp.Path, "/file", remote.Client));
         else
-            Check(AutoSSHApp.BackupFile(temp.Path, "/file", remote.Client) == 0, "Incomplete download counted as successful.");
+            Check(BackupFile(temp.Path, "/file", remote.Client) == 0, "Incomplete download counted as successful.");
         Check(File.ReadAllText(localFile) == "previous backup", "Previous backup was damaged.");
         Check(Directory.GetFiles(temp.Path).Length == 1, "Temporary file was left behind.");
         remote.PartialDownload = remote.StallDownload = false;
-        AutoSSHApp.BackupFile(temp.Path, "/file", remote.Client);
+        BackupFile(temp.Path, "/file", remote.Client);
         Check(File.ReadAllText(localFile) == "new complete content", "Subsequent sync failed.");
     }
 }
@@ -180,7 +191,7 @@ static void BackupSessionFailures()
         remote.AddFile("/data/nested/b", "b");
         int failures = 0;
         remote.Before = method => { if (method == operation) { failures++; throw error; } };
-        Throws<SshException>(() => AutoSSHApp.BackupFolder(Host(), temp.Path, "/data", remote.Client, TextWriter.Null));
+        Throws<SshException>(() => BackupFolder(Host(), temp.Path, "/data", remote.Client, TextWriter.Null));
         Check(failures == 1, "Kept using the failed SFTP session.");
     }
 }
@@ -197,7 +208,7 @@ static void UploadTree()
         var remote = new FakeSftp();
         string root = destination.TrimEnd('/');
         remote.Uploaded[root + "/one/two/file.txt"] = Encoding.UTF8.GetBytes("old, longer contents");
-        long size = AutoSSHApp.UploadFolder(Host("ignore"), temp.Path + ";" + destination, remote.Client, TextWriter.Null);
+        long size = UploadFolder(Host("ignore"), temp.Path + ";" + destination, remote.Client, TextWriter.Null);
         Check(size == 9, "Wrong upload size.");
         Check(remote.Uploads == 2 && remote.MaxActive == 1, "Uploads overlap or ignore failed.");
         Check(Encoding.UTF8.GetString(remote.Uploaded[root + "/one/two/file.txt"]) == "short", "Upload did not truncate or used wrong path.");
@@ -216,7 +227,7 @@ static void UploadSessionFailures()
         var remote = new FakeSftp();
         int failures = 0;
         remote.Before = method => { if (method == operation) { failures++; throw new SshOperationTimeoutException("stalled"); } };
-        Throws<SshOperationTimeoutException>(() => AutoSSHApp.UploadFolder(Host(), temp.Path + ";/target", remote.Client, TextWriter.Null));
+        Throws<SshOperationTimeoutException>(() => UploadFolder(Host(), temp.Path + ";/target", remote.Client, TextWriter.Null));
         Check(failures == 1, "Kept uploading on a failed session.");
     }
 }
@@ -282,6 +293,72 @@ sealed class FakeSftp
             _ => throw new NotSupportedException(method.Name)
         });
     }
+
+    async IAsyncEnumerable<ISftpFile> ListDirectoryAsync(string path)
+    {
+        await Task.Yield();
+        Before?.Invoke("ListDirectory");
+        string prefix = path + "/";
+        foreach (var file in files.Where(pair => pair.Key.StartsWith(prefix) &&
+            !pair.Key[prefix.Length..].Contains('/')).Select(pair => pair.Value))
+        {
+            yield return file;
+        }
+    }
+
+    async Task DownloadFileAsync(string path, Stream output)
+    {
+        await Task.Yield();
+        Before?.Invoke("DownloadFile");
+        Interlocked.Increment(ref Downloads);
+        byte[] bytes = content[path];
+        await output.WriteAsync(bytes.AsMemory(0, PartialDownload ? 1 : bytes.Length));
+        if (StallDownload) throw new SshOperationTimeoutException("stalled download");
+    }
+
+    async Task<bool> ExistsAsync(string path)
+    {
+        await Task.Yield();
+        Before?.Invoke("Exists");
+        return files.ContainsKey(path) || Directories.Contains(path);
+    }
+
+    async Task<SftpFileAttributes> GetAttributesAsync(string path)
+    {
+        await Task.Yield();
+        Before?.Invoke("Get");
+        if (!content.TryGetValue(path, out byte[] bytes)) throw new SftpPathNotFoundException(path);
+        uint permissions = bytes == null ? 16877u : 33188u;
+        var constructor = typeof(SftpFileAttributes).GetConstructors(
+            BindingFlags.Instance | BindingFlags.NonPublic).Single();
+        return (SftpFileAttributes)constructor.Invoke(new object[]
+        {
+            Timestamp, Timestamp, (long)(bytes?.Length ?? 0), 0, 0, permissions,
+            new Dictionary<string, string>()
+        });
+    }
+
+    async Task CreateDirectoryAsync(string directory)
+    {
+        await Task.Yield();
+        Before?.Invoke("CreateDirectory");
+        int slash = directory.LastIndexOf('/');
+        string parent = slash <= 0 ? "/" : directory[..slash];
+        if (!Directories.Contains(parent)) throw new SftpPathNotFoundException("Missing parent " + parent);
+        Directories.Add(directory);
+    }
+
+    async Task UploadFileAsync(Stream input, string path, bool overwrite)
+    {
+        await Task.Yield();
+        Before?.Invoke("UploadFile");
+        Interlocked.Increment(ref Uploads);
+        if (!overwrite) throw new InvalidOperationException("Expected overwrite.");
+        using var data = new MemoryStream();
+        await input.CopyToAsync(data);
+        Uploaded[path] = data.ToArray();
+    }
+
     object Invoke(MethodInfo method, object[] args)
     {
         int current = Interlocked.Increment(ref active);
@@ -289,16 +366,22 @@ sealed class FakeSftp
         do { previous = MaxActive; } while (current > previous && Interlocked.CompareExchange(ref MaxActive, current, previous) != previous);
         try
         {
-            Before?.Invoke(method.Name);
+            string operation = method.Name.EndsWith("Async") ? method.Name[..^5] : method.Name;
+            if (!method.Name.EndsWith("Async")) Before?.Invoke(operation);
             switch (method.Name)
             {
                 case "Exists": return files.ContainsKey((string)args[0]) || Directories.Contains((string)args[0]);
+                case "ExistsAsync": return ExistsAsync((string)args[0]);
                 case "Dispose": Disposals++; return null;
                 case "Get": Gets++; return files[(string)args[0]];
+                case "GetAttributesAsync": Gets++; return GetAttributesAsync((string)args[0]);
                 case "ListDirectory":
                     Listings++;
                     string prefix = (string)args[0] + "/";
                     return files.Where(pair => pair.Key.StartsWith(prefix) && !pair.Key[prefix.Length..].Contains('/')).Select(pair => pair.Value).ToArray();
+                case "ListDirectoryAsync":
+                    Listings++;
+                    return ListDirectoryAsync((string)args[0]);
                 case "DownloadFile":
                     Interlocked.Increment(ref Downloads);
                     Thread.Sleep(2); // Expose accidental parallel use of this session.
@@ -308,6 +391,8 @@ sealed class FakeSftp
                     if (StallDownload) throw new SshOperationTimeoutException("stalled download");
                     ((Action<ulong>)args[2])?.Invoke((ulong)output.Length);
                     return null;
+                case "DownloadFileAsync":
+                    return DownloadFileAsync((string)args[0], (Stream)args[1]);
                 case "CreateDirectory":
                     string dir = (string)args[0];
                     int slash = dir.LastIndexOf('/');
@@ -315,6 +400,7 @@ sealed class FakeSftp
                     if (!Directories.Contains(parent)) throw new SftpPathNotFoundException("Missing parent " + parent);
                     Directories.Add(dir);
                     return null;
+                case "CreateDirectoryAsync": return CreateDirectoryAsync((string)args[0]);
                 case "UploadFile":
                     Interlocked.Increment(ref Uploads);
                     Thread.Sleep(2);
@@ -326,6 +412,8 @@ sealed class FakeSftp
                         ((Action<ulong>)args[3])?.Invoke((ulong)data.Length);
                     }
                     return null;
+                case "UploadFileAsync":
+                    return UploadFileAsync((Stream)args[0], (string)args[1], (bool)args[2]);
                 default: throw new NotSupportedException(method.Name);
             }
         }

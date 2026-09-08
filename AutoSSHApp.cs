@@ -6,7 +6,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Runtime.ExceptionServices;
+using System.Runtime.CompilerServices;
 using System.Security;
 using System.Security.Cryptography;
 using System.Text;
@@ -38,7 +38,7 @@ namespace AutoSSH
         }
 
         // Each host owns its clients. Never run concurrent operations on one SFTP session.
-        private static readonly ParallelOptions hostParallelOptions = new ParallelOptions { MaxDegreeOfParallelism = 4 };
+        private const int hostWorkers = 4;
         private static readonly int downloadWorkers = GetDownloadWorkers();
         private static readonly TimeSpan connectionTimeout = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan operationTimeout = GetTimeout("AUTOSSH_SFTP_TIMEOUT_SECONDS", 60);
@@ -279,7 +279,7 @@ namespace AutoSSH
             return LoadCommands(commandFile);
         }
 
-        private static BaseClient Connect(string root, HostEntry host, bool ssh)
+        private static async Task<BaseClient> ConnectAsync(string root, HostEntry host, bool ssh)
         {
             Console.WriteLine("Connecting to {0} with type {1}", host, ssh ? "SSH" : "SFTP");
             root = Path.Combine(root, host.Name);
@@ -309,7 +309,7 @@ namespace AutoSSH
             };
             try
             {
-                client.Connect();
+                await client.ConnectAsync(CancellationToken.None);
                 if (!client.IsConnected || !client.ConnectionInfo.IsAuthenticated)
                 {
                     throw new SshConnectionException($"Failed to connect to {host}, finger match: {fingerMatch}");
@@ -366,89 +366,128 @@ namespace AutoSSH
             return Path.Combine(root, localPath);
         }
 
-        internal static long BackupFile(string root, string remotePath, ISftpClient client, ISftpFile file = null)
+        private static async Task<long> BackupFileAsync(string root, BackupEntry file, ISftpClient client,
+            CancellationToken cancellation)
         {
-            string fileName = BackupFileName(root, remotePath);
+            string fileName = BackupFileName(root, file.FullName);
             try
             {
-                file ??= client.Get(remotePath);
-                if (file.IsRegularFile && 
-                    (!File.Exists(fileName) || file.LastWriteTimeUtc > File.GetLastWriteTimeUtc(fileName)))
+                string tempFile = fileName + "." + Guid.NewGuid().ToString("N") + ".__TEMP__";
+                Directory.CreateDirectory(Path.GetDirectoryName(fileName));
+                try
                 {
-                    string tempFile = fileName + "." + Guid.NewGuid().ToString("N") + ".__TEMP__";
-                    Directory.CreateDirectory(Path.GetDirectoryName(fileName));
+                    await using (FileStream stream = File.Create(tempFile))
+                    {
+                        await client.DownloadFileAsync(file.FullName, stream, cancellation);
+                    }
+                    if (new FileInfo(tempFile).Length != file.Length)
+                    {
+                        throw new IOException($"Incomplete download of {file.FullName}; expected {file.Length} bytes.");
+                    }
+                    File.SetLastWriteTimeUtc(tempFile, file.LastWriteTimeUtc);
+                    File.Move(tempFile, fileName, overwrite: true);
+                    Interlocked.Add(ref bytesDownloaded, file.Length);
+                    return file.Length;
+                }
+                finally
+                {
                     try
                     {
-                        using (FileStream stream = File.Create(tempFile))
-                        {
-                            var progress = new TransferProgress(delta => Interlocked.Add(ref bytesDownloaded, delta));
-                            client.DownloadFile(remotePath, stream, progress.Report);
-                            progress.Report((ulong)stream.Length);
-                        }
-                        if (new FileInfo(tempFile).Length != file.Length)
-                        {
-                            throw new IOException($"Incomplete download of {remotePath}; expected {file.Length} bytes.");
-                        }
-                        File.SetLastWriteTimeUtc(tempFile, file.LastWriteTimeUtc);
-                        File.Move(tempFile, fileName, overwrite: true);
+                        File.Delete(tempFile);
                     }
-                    finally
+                    catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
                     {
-                        // A failed transfer must leave the previous backup intact.
-                        try
-                        {
-                            File.Delete(tempFile);
-                        }
-                        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
-                        {
-                            Console.WriteLine("Unable to remove temporary file {0}: {1}", tempFile, ex.Message);
-                        }
+                        Console.WriteLine("Unable to remove temporary file {0}: {1}", tempFile, ex.Message);
                     }
                 }
-                else
-                {
-                    Interlocked.Add(ref bytesSkipped, file.Length);
-                }
-                return file.Length;
             }
             catch (SftpPathNotFoundException)
             {
-                // OK
+                return 0;
             }
             catch (SftpPermissionDeniedException)
             {
-                // OK
+                return 0;
             }
-            catch (Exception ex) when (ex is not SshException && ex is not TimeoutException)
+            catch (Exception ex) when (ex is not SshException && ex is not TimeoutException && ex is not OperationCanceledException)
             {
                 Console.WriteLine("Error: {0}         ", ex.Message);
+                return 0;
             }
-            return 0;
         }
 
-        private static ISftpFile[] ReadBackupEntries(Func<IEnumerable<ISftpFile>> read, string path, TextWriter log)
+        private sealed record BackupEntry(string FullName, string Name, bool IsRegularFile,
+            bool IsDirectory, long Length, DateTime LastWriteTimeUtc);
+
+        private static async Task<BackupEntry> ReadBackupRootAsync(ISftpClient client, string path,
+            TextWriter log, CancellationToken cancellation)
         {
-            try { return read().ToArray(); }
+            try
+            {
+                var attributes = await client.GetAttributesAsync(path, cancellation);
+                return new BackupEntry(path, Path.GetFileName(path.TrimEnd('/', '\\')),
+                    attributes.IsRegularFile, attributes.IsDirectory, attributes.Size, attributes.LastWriteTimeUtc);
+            }
             catch (SftpPathNotFoundException) { }
             catch (SftpPermissionDeniedException ex)
             {
                 log.WriteLine("Error backing up {0}: {1}", path, ex.Message);
             }
-            catch (Exception ex) when (ex is not SshException && ex is not TimeoutException)
+            catch (Exception ex) when (ex is not SshException && ex is not TimeoutException && ex is not OperationCanceledException)
             {
                 log.WriteLine("Error backing up {0}: {1}", path, ex);
             }
-            return Array.Empty<ISftpFile>();
+            return null;
         }
 
-        private static IEnumerable<ISftpFile> EnumerateBackupFiles(HostEntry host, string path,
-            ISftpClient client, TextWriter log, CancellationToken cancellation)
+        internal static async Task<long> BackupFileAsync(string root, string remotePath, ISftpClient client,
+            CancellationToken cancellation = default)
         {
-            // Only the enumerator uses this session. Listing metadata is sufficient for sync checks.
+            var file = await ReadBackupRootAsync(client, remotePath, TextWriter.Null, cancellation);
+            if (file == null || !file.IsRegularFile) return 0;
+            string localFile = BackupFileName(root, remotePath);
+            if (File.Exists(localFile) && file.LastWriteTimeUtc <= File.GetLastWriteTimeUtc(localFile))
+            {
+                Interlocked.Add(ref bytesSkipped, file.Length);
+                return file.Length;
+            }
+            return await BackupFileAsync(root, file, client, cancellation);
+        }
+
+        private static async Task<List<BackupEntry>> ReadBackupEntriesAsync(ISftpClient client, string path,
+            TextWriter log, CancellationToken cancellation)
+        {
+            var entries = new List<BackupEntry>();
+            try
+            {
+                await foreach (var file in client.ListDirectoryAsync(path, cancellation))
+                {
+                    entries.Add(new BackupEntry(file.FullName, file.Name, file.IsRegularFile,
+                        file.IsDirectory, file.Length, file.LastWriteTimeUtc));
+                }
+            }
+            catch (SftpPathNotFoundException) { }
+            catch (SftpPermissionDeniedException ex)
+            {
+                log.WriteLine("Error backing up {0}: {1}", path, ex.Message);
+            }
+            catch (Exception ex) when (ex is not SshException && ex is not TimeoutException && ex is not OperationCanceledException)
+            {
+                log.WriteLine("Error backing up {0}: {1}", path, ex);
+            }
+            return entries;
+        }
+
+        private static async IAsyncEnumerable<BackupEntry> EnumerateBackupFilesAsync(HostEntry host, string path,
+            ISftpClient client, TextWriter log, [EnumeratorCancellation] CancellationToken cancellation)
+        {
             foreach (string root in path.Split('|').Select(s => s.Trim()).Where(s => s.Length != 0))
             {
                 cancellation.ThrowIfCancellationRequested();
-                var pending = new Stack<ISftpFile>(ReadBackupEntries(() => new[] { client.Get(root) }, root, log));
+                var rootEntry = await ReadBackupRootAsync(client, root, log, cancellation);
+                if (rootEntry == null) continue;
+                var pending = new Stack<BackupEntry>();
+                pending.Push(rootEntry);
                 while (pending.Count != 0)
                 {
                     cancellation.ThrowIfCancellationRequested();
@@ -459,7 +498,7 @@ namespace AutoSSH
                     }
                     else if (entry.IsDirectory)
                     {
-                        foreach (var child in ReadBackupEntries(() => client.ListDirectory(entry.FullName), entry.FullName, log))
+                        foreach (var child in await ReadBackupEntriesAsync(client, entry.FullName, log, cancellation))
                         {
                             if ((child.IsRegularFile || (child.IsDirectory && !child.Name.StartsWith("."))) &&
                                 (host.IgnoreRegex == null || !host.IgnoreRegex.IsMatch(child.FullName)))
@@ -472,86 +511,92 @@ namespace AutoSSH
             }
         }
 
-        internal static long BackupFolder(HostEntry host, string root, string path, ISftpClient client, TextWriter log,
-            Func<ISftpClient> createDownloadClient = null, int workers = 4)
+        internal static async Task<long> BackupFolderAsync(HostEntry host, string root, string path,
+            ISftpClient client, TextWriter log, Func<Task<ISftpClient>> createDownloadClient = null, int workers = 4)
         {
             if (workers < 1 || workers > 16) throw new ArgumentOutOfRangeException(nameof(workers));
             long size = 0;
             using var cancellation = new CancellationTokenSource();
-            IEnumerable<ISftpFile> ChangedFiles()
+            var changedFiles = new List<BackupEntry>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            // Complete the async scan before opening download sessions. This avoids loading
+            // the server with downloads while it is still answering directory requests.
+            await foreach (var file in EnumerateBackupFilesAsync(host, path, client, log, cancellation.Token))
             {
-                // Avoid opening download connections for unchanged backups or repeated/overlapping roots.
-                var seen = new HashSet<string>(StringComparer.Ordinal);
-                foreach (var file in EnumerateBackupFiles(host, path, client, log, cancellation.Token))
+                if (!seen.Add(file.FullName)) continue;
+                string localFile = BackupFileName(root, file.FullName);
+                if (File.Exists(localFile) && file.LastWriteTimeUtc <= File.GetLastWriteTimeUtc(localFile))
                 {
-                    if (!seen.Add(file.FullName)) continue;
-                    string localFile = BackupFileName(root, file.FullName);
-                    if (File.Exists(localFile) && file.LastWriteTimeUtc <= File.GetLastWriteTimeUtc(localFile))
-                    {
-                        Interlocked.Add(ref bytesSkipped, file.Length);
-                        Interlocked.Add(ref size, file.Length);
-                    }
-                    else
-                    {
-                        yield return file;
-                    }
+                    Interlocked.Add(ref bytesSkipped, file.Length);
+                    Interlocked.Add(ref size, file.Length);
+                }
+                else
+                {
+                    changedFiles.Add(file);
                 }
             }
 
             if (createDownloadClient == null || workers == 1)
             {
-                foreach (var file in ChangedFiles())
-                    size += BackupFile(root, file.FullName, client, file);
+                foreach (var file in changedFiles)
+                    size += await BackupFileAsync(root, file, client, cancellation.Token);
+                return size;
             }
-            else
+
+            int nextFile = -1;
+            int taskCount = Math.Min(workers, changedFiles.Count);
+            async Task DownloadWorkerAsync()
             {
+                ISftpClient downloadClient = null;
                 try
                 {
-                    // Each worker exclusively owns its client; the original client only scans directories.
-                    Parallel.ForEach(ChangedFiles(),
-                        new ParallelOptions { MaxDegreeOfParallelism = workers, CancellationToken = cancellation.Token },
-                        () => new Lazy<ISftpClient>(createDownloadClient),
-                        (file, state, downloadClient) =>
+                    while (true)
+                    {
+                        int index = Interlocked.Increment(ref nextFile);
+                        if (index >= changedFiles.Count) break;
+                        try
                         {
-                            try
-                            {
-                                cancellation.Token.ThrowIfCancellationRequested();
-                                Interlocked.Add(ref size, BackupFile(root, file.FullName, downloadClient.Value, file));
-                                return downloadClient;
-                            }
-                            catch
-                            {
-                                cancellation.Cancel();
-                                throw;
-                            }
-                        },
-                        downloadClient => { if (downloadClient.IsValueCreated) downloadClient.Value.Dispose(); });
+                            cancellation.Token.ThrowIfCancellationRequested();
+                            downloadClient ??= await createDownloadClient();
+                            Interlocked.Add(ref size,
+                                await BackupFileAsync(root, changedFiles[index], downloadClient, cancellation.Token));
+                        }
+                        catch
+                        {
+                            cancellation.Cancel();
+                            throw;
+                        }
+                    }
                 }
-                catch (AggregateException ex)
+                finally
                 {
-                    // Preserve the original session failure instead of reporting sibling cancellation.
-                    Exception error = ex.Flatten().InnerExceptions.FirstOrDefault(e => e is not OperationCanceledException) ?? ex;
-                    ExceptionDispatchInfo.Capture(error).Throw();
+                    downloadClient?.Dispose();
                 }
             }
+
+            await Task.WhenAll(Enumerable.Range(0, taskCount).Select(_ => DownloadWorkerAsync()));
             return size;
         }
 
-        private static void EnsureRemoteDirectory(ISftpClient client, string directory)
+        private static async Task EnsureRemoteDirectoryAsync(ISftpClient client, string directory,
+            CancellationToken cancellation)
         {
-            if (directory.Length == 0 || directory == "/" || directory == "." || client.Exists(directory))
+            if (directory.Length == 0 || directory == "/" || directory == "." ||
+                await client.ExistsAsync(directory, cancellation))
             {
                 return;
             }
             int separator = directory.LastIndexOf('/');
             if (separator > 0)
             {
-                EnsureRemoteDirectory(client, directory.Substring(0, separator));
+                await EnsureRemoteDirectoryAsync(client, directory.Substring(0, separator), cancellation);
             }
-            client.CreateDirectory(directory);
+            await client.CreateDirectoryAsync(directory, cancellation);
         }
 
-        internal static long UploadFolder(HostEntry host, string pathInfo, ISftpClient client, TextWriter log)
+        internal static async Task<long> UploadFolderAsync(HostEntry host, string pathInfo, ISftpClient client,
+            TextWriter log, CancellationToken cancellation = default)
         {
             long uploadSize = 0;
             string[] paths = pathInfo.Split(';', 2);
@@ -573,11 +618,10 @@ namespace AutoSSH
                 string remoteDir = remoteFile.Substring(0, remoteFile.LastIndexOf('/'));
                 try
                 {
-                    EnsureRemoteDirectory(client, remoteDir);
-                    using var localStream = File.OpenRead(file);
-                    var progress = new TransferProgress(delta => Interlocked.Add(ref bytesUploaded, delta));
-                    client.UploadFile(localStream, remoteFile, true, progress.Report);
-                    progress.Report((ulong)localStream.Length);
+                    await EnsureRemoteDirectoryAsync(client, remoteDir, cancellation);
+                    await using var localStream = File.OpenRead(file);
+                    await client.UploadFileAsync(localStream, remoteFile, true, null, cancellation);
+                    Interlocked.Add(ref bytesUploaded, localStream.Length);
                     uploadSize += localStream.Length;
                 }
                 catch (SftpPermissionDeniedException ex)
@@ -588,7 +632,7 @@ namespace AutoSSH
                 {
                     log.WriteLine("Error uploading file {0} to {1}: {2}", file, remoteFile, ex.Message);
                 }
-                catch (Exception ex) when (ex is not SshException && ex is not TimeoutException)
+                catch (Exception ex) when (ex is not SshException && ex is not TimeoutException && ex is not OperationCanceledException)
                 {
                     log.WriteLine("Error uploading file {0} to {1}: {2}", file, remoteFile, ex);
                 }
@@ -610,7 +654,7 @@ namespace AutoSSH
             return output;
         }
 
-        private static void ClientLoop(string root, HostEntry host, List<string> commands)
+        private static async Task ClientLoopAsync(string root, HostEntry host, List<string> commands)
         {
             string logFile = Path.Combine(root, host.Name, "log.txt");
             string backupPath = Path.Combine(root, host.Name, "backup");
@@ -618,9 +662,9 @@ namespace AutoSSH
             long uploadSize = 0;
             Directory.CreateDirectory(Path.GetDirectoryName(logFile));
             using (StreamWriter writer = File.CreateText(logFile))
-            using (SshClient client = (SshClient)Connect(root, host, true))
+            using (SshClient client = (SshClient)await ConnectAsync(root, host, true))
             using (ShellStream stream = client.CreateShellStream("xterm", 255, 50, 800, 600, 1024, null))
-            using (SftpClient sftpClient = (SftpClient)Connect(root, host, false))
+            using (SftpClient sftpClient = (SftpClient)await ConnectAsync(root, host, false))
             {
                 ExpectPrompt(stream, host.IsWindows ? windowsPromptRegex : loginPromptRegex, connectionTimeout, writer, "the login prompt");
                 if (!host.IsWindows)
@@ -642,12 +686,12 @@ namespace AutoSSH
                     {
                         if (command.StartsWith("$backup ", StringComparison.OrdinalIgnoreCase))
                         {
-                            backupSize += BackupFolder(host, backupPath, command.Substring(8), sftpClient, writer,
-                                () => (SftpClient)Connect(root, host, false), downloadWorkers);
+                            backupSize += await BackupFolderAsync(host, backupPath, command.Substring(8), sftpClient, writer,
+                                async () => (SftpClient)await ConnectAsync(root, host, false), downloadWorkers);
                         }
                         else if (command.StartsWith("$upload ", StringComparison.OrdinalIgnoreCase))
                         {
-                            uploadSize += UploadFolder(host, command.Substring(8), sftpClient, writer);
+                            uploadSize += await UploadFolderAsync(host, command.Substring(8), sftpClient, writer);
                         }
                         else if (command.StartsWith("$ignore ", StringComparison.OrdinalIgnoreCase))
                         {
@@ -669,7 +713,7 @@ namespace AutoSSH
             Console.WriteLine("{0} uploaded {1}                      ", host, BytesToString(uploadSize));
         }
 
-        public static void Main(string[] args)
+        public static async Task Main(string[] args)
         {
             if (args.Length != 2)
             {
@@ -692,24 +736,25 @@ namespace AutoSSH
 
             // 4x second update rate
             updateTimer.Change(1, 250);
-            Parallel.ForEach(commands, hostParallelOptions, (kv) =>
+            using var hostGate = new SemaphoreSlim(hostWorkers);
+            Task[] hostTasks = commands.Select(async kv =>
             {
+                await hostGate.WaitAsync();
                 try
                 {
-                    ClientLoop(backupFolder, kv.Key, kv.Value);
+                    await ClientLoopAsync(backupFolder, kv.Key, kv.Value);
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine("Error on host {0}: {1}\r\n", kv.Key.Host, ex);
                 }
-            });
-            using (var timerStopped = new ManualResetEvent(false))
-            {
-                if (updateTimer.Dispose(timerStopped))
+                finally
                 {
-                    timerStopped.WaitOne();
+                    hostGate.Release();
                 }
-            }
+            }).ToArray();
+            await Task.WhenAll(hostTasks);
+            await updateTimer.DisposeAsync();
             Console.WriteLine("Bytes downloaded: {0}    ", BytesToString(bytesDownloaded));
             Console.WriteLine("Bytes uploaded: {0}   ", BytesToString(bytesUploaded));
             Console.WriteLine("Bytes skipped: {0}   ", BytesToString(bytesSkipped));

@@ -5,6 +5,17 @@ using Renci.SshNet.Common;
 
 static class IntegrationTests
 {
+    static long BackupFile(string root, string path, ISftpClient client) =>
+        AutoSSHApp.BackupFileAsync(root, path, client).GetAwaiter().GetResult();
+
+    static long BackupFolder(AutoSSHApp.HostEntry host, string root, string path, ISftpClient client,
+        TextWriter log, Func<ISftpClient> createClient = null, int workers = 4) =>
+        AutoSSHApp.BackupFolderAsync(host, root, path, client, log,
+            createClient == null ? null : () => Task.FromResult(createClient()), workers).GetAwaiter().GetResult();
+
+    static long UploadFolder(AutoSSHApp.HostEntry host, string path, ISftpClient client, TextWriter log) =>
+        AutoSSHApp.UploadFolderAsync(host, path, client, log).GetAwaiter().GetResult();
+
     internal static void Run(int port)
     {
         var host = new AutoSSHApp.HostEntry { Host = "127.0.0.1", Name = "test" };
@@ -23,9 +34,9 @@ static class IntegrationTests
         string backupDir = Path.Combine(temp.Path, "backup");
         using (var client = Connect())
         {
-            long size = AutoSSHApp.UploadFolder(host, uploadDir + ";/target", client, Console.Out);
+            long size = UploadFolder(host, uploadDir + ";/target", client, Console.Out);
             Require(size == contents.Length, "Upload byte count mismatch.");
-            size = AutoSSHApp.BackupFolder(host, backupDir, "/target", client, Console.Out);
+            size = BackupFolder(host, backupDir, "/target", client, Console.Out);
             Require(size == contents.Length, "Backup byte count mismatch.");
             Require(File.ReadAllBytes(Path.Combine(backupDir, "target/nested/file.bin")).SequenceEqual(contents), "Round trip corrupted data.");
         }
@@ -34,17 +45,17 @@ static class IntegrationTests
         for (int i = 0; i < 24; i++) File.WriteAllBytes(Path.Combine(manyFiles, "file" + i), contents[..8192]);
         using (var client = Connect())
         {
-            AutoSSHApp.UploadFolder(host, manyFiles + ";/parallel", client, Console.Out);
+            UploadFolder(host, manyFiles + ";/parallel", client, Console.Out);
             var transferTimer = Stopwatch.StartNew();
-            long sequentialSize = AutoSSHApp.BackupFolder(host, Path.Combine(temp.Path, "serial"), "/parallel", client, Console.Out);
+            long sequentialSize = BackupFolder(host, Path.Combine(temp.Path, "serial"), "/parallel", client, Console.Out);
             double sequentialMs = transferTimer.Elapsed.TotalMilliseconds;
             transferTimer.Restart();
-            long parallelSize = AutoSSHApp.BackupFolder(host, backupDir, "/parallel", client, Console.Out, Connect, 4);
+            long parallelSize = BackupFolder(host, backupDir, "/parallel", client, Console.Out, Connect, 4);
             double parallelMs = transferTimer.Elapsed.TotalMilliseconds;
             Require(sequentialSize == 24 * 8192 && parallelSize == sequentialSize, "Concurrent backup byte count mismatch.");
             for (int i = 0; i < 24; i++)
                 Require(File.ReadAllBytes(Path.Combine(backupDir, "parallel/file" + i)).SequenceEqual(contents[..8192]), "Concurrent download corrupted data.");
-            long skippedSize = AutoSSHApp.BackupFolder(host, backupDir, "/parallel", client, Console.Out,
+            long skippedSize = BackupFolder(host, backupDir, "/parallel", client, Console.Out,
                 () => throw new InvalidOperationException("Unchanged backup opened a worker connection."), 4);
             Require(skippedSize == parallelSize, "Unchanged parallel backup size mismatch.");
             Console.WriteLine($"Local 24-file download: sequential {sequentialMs:F0} ms, four workers {parallelMs:F0} ms (includes worker connections).");
@@ -54,7 +65,7 @@ static class IntegrationTests
             var watch = Stopwatch.StartNew();
             try
             {
-                AutoSSHApp.BackupFile(backupDir, "/stall.bin", client);
+                BackupFile(backupDir, "/stall.bin", client);
                 throw new InvalidOperationException("Stalled SFTP download did not time out.");
             }
             catch (SshOperationTimeoutException) { }
@@ -66,7 +77,7 @@ static class IntegrationTests
             var watch = Stopwatch.StartNew();
             try
             {
-                AutoSSHApp.BackupFolder(host, backupDir, "/stall-dir", client, Console.Out);
+                BackupFolder(host, backupDir, "/stall-dir", client, Console.Out);
                 throw new InvalidOperationException("Stalled directory listing did not time out.");
             }
             catch (SshOperationTimeoutException) { }
@@ -77,7 +88,7 @@ static class IntegrationTests
             var watch = Stopwatch.StartNew();
             try
             {
-                AutoSSHApp.UploadFolder(host, uploadDir + ";/stall-upload", client, Console.Out);
+                UploadFolder(host, uploadDir + ";/stall-upload", client, Console.Out);
                 throw new InvalidOperationException("Stalled upload did not time out.");
             }
             catch (SshOperationTimeoutException) { }
