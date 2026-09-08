@@ -58,3 +58,27 @@ $backup /C:/Backup/File.txt|/C:/Backup2/File2.txt
 For $backup commands, the first run will be slow and backup everything. Subsequent runs will check the last write time UTC timestamp of files and compare to the local files before downloading.
 
 Each backed up file writes to a temp file, and only upon successful completion of the download, renames to the final file name.
+
+
+Backups download up to four files concurrently per host, each worker using its own SFTP connection plus a separate connection for directory scanning. Up to four hosts are processed concurrently. Sync reuses directory-listing metadata to skip unchanged files without extra per-file metadata requests, and opens download connections only when files need downloading. Uploads remain sequential within each host's SFTP connection. SSH connections send keepalives every 15 seconds. Connection and login/sudo prompt waits time out after 30 seconds; SFTP operations time out after 60 seconds, and shell commands after 30 minutes. A connection or operation timeout stops further work on that host and reports an error while other hosts continue. Run the command file again to retry; completed backups are skipped using their timestamps.
+
+Set `AUTOSSH_DOWNLOAD_WORKERS` to a whole number from 1 to 16 to change download concurrency per host (default 4). Set it to 1 to use only the original SFTP connection for sequential transfers.
+
+Set `AUTOSSH_SFTP_TIMEOUT_SECONDS` or `AUTOSSH_COMMAND_TIMEOUT_SECONDS` before starting AutoSSH to override the transfer-operation or command timeout. Values must be positive whole seconds (at most 2147483). The SFTP timeout applies to individual protocol waits, so a large file can take longer as long as the server keeps responding. The command timeout limits the entire wait for the shell prompt; increase it for long-running commands.
+
+Failed or incomplete downloads remove their temporary file and preserve any previous backup. Uploads overwrite and truncate existing remote files and create missing parent directories.
+
+To run regression checks without a remote server:
+
+```text
+dotnet run --project tests/AutoSSH.RegressionTests -c Release
+```
+
+To additionally test real SSH/SFTP transfers and deliberately stalled downloads, uploads, directory listings, and shell prompts on a disposable localhost server (requires Python):
+
+```text
+python -m pip install --target obj/sftp-test-python paramiko==5.0.0
+python tests/run-sftp-integration.py
+```
+
+The integration server binds only to loopback on an automatically assigned port, uses temporary files and test credentials, and shuts down when the tests finish.

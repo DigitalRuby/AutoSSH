@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Runtime.ExceptionServices;
 using System.Security;
 using System.Security.Cryptography;
 using System.Text;
@@ -16,7 +17,6 @@ using System.Threading;
 using Renci.SshNet;
 using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
-using System.Buffers;
 
 #endregion Imports
 
@@ -24,7 +24,7 @@ namespace AutoSSH
 {
     public static class AutoSSHApp
     {
-        private class HostEntry
+        internal class HostEntry
         {
             public string Host { get; set; }
             public string Name { get; set; }
@@ -37,8 +37,51 @@ namespace AutoSSH
             }
         }
 
-        private static readonly ParallelOptions parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = 64 };
-        private static readonly ParallelOptions parallelOptions2 = new ParallelOptions { MaxDegreeOfParallelism = 16 };
+        // Each host owns its clients. Never run concurrent operations on one SFTP session.
+        private static readonly ParallelOptions hostParallelOptions = new ParallelOptions { MaxDegreeOfParallelism = 4 };
+        private static readonly int downloadWorkers = GetDownloadWorkers();
+        private static readonly TimeSpan connectionTimeout = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan operationTimeout = GetTimeout("AUTOSSH_SFTP_TIMEOUT_SECONDS", 60);
+        private static readonly TimeSpan commandTimeout = GetTimeout("AUTOSSH_COMMAND_TIMEOUT_SECONDS", 1800);
+
+        private static int GetDownloadWorkers()
+        {
+            string value = Environment.GetEnvironmentVariable("AUTOSSH_DOWNLOAD_WORKERS");
+            if (string.IsNullOrWhiteSpace(value)) return 4;
+            if (int.TryParse(value, out int workers) && workers >= 1 && workers <= 16) return workers;
+            throw new ArgumentException("AUTOSSH_DOWNLOAD_WORKERS must be a whole number from 1 to 16.");
+        }
+
+        private static TimeSpan GetTimeout(string name, int defaultSeconds)
+        {
+            string value = Environment.GetEnvironmentVariable(name);
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return TimeSpan.FromSeconds(defaultSeconds);
+            }
+            if (!int.TryParse(value, out int seconds) || seconds <= 0 || seconds > int.MaxValue / 1000)
+            {
+                throw new ArgumentException($"{name} must be a positive number of seconds no greater than {int.MaxValue / 1000}.");
+            }
+            return TimeSpan.FromSeconds(seconds);
+        }
+
+        internal static void ConfigureClient(BaseClient client)
+        {
+            client.ConnectionInfo.Timeout = connectionTimeout;
+            client.KeepAliveInterval = TimeSpan.FromSeconds(15);
+            if (client is SftpClient sftpClient)
+            {
+                sftpClient.OperationTimeout = operationTimeout;
+            }
+        }
+        // Accept trailing terminal color/reset sequences as well as plain prompts.
+        private const string promptSuffix = @"(?:[ \t]|\x1b\[[0-?]*[ -/]*[@-~])*\r?$";
+        internal static readonly Regex loginPromptRegex = new Regex(@"(?m)[$#>]" + promptSuffix);
+        internal static readonly Regex rootPromptRegex = new Regex(@"(?m)#" + promptSuffix);
+        internal static readonly Regex windowsPromptRegex = new Regex(@"(?m)>" + promptSuffix);
+        internal static readonly Regex sudoPromptRegex = new Regex(@"(?m)[Pp]assword[^\r\n]*:" + promptSuffix + "|" + rootPromptRegex);
+
         private static SecureString userName;
         private static SecureString password;
         private static long bytesDownloaded;
@@ -241,26 +284,18 @@ namespace AutoSSH
             Console.WriteLine("Connecting to {0} with type {1}", host, ssh ? "SSH" : "SFTP");
             root = Path.Combine(root, host.Name);
             Directory.CreateDirectory(root);
-            MemoryStream finger = new();
-            bool hasFinger = false;
             string fingerFile = Path.Combine(root, "finger.key");
-            if (File.Exists(fingerFile))
-            {
-                hasFinger = true;
-                using (Stream fs = File.OpenRead(fingerFile))
-                {
-                    fs.CopyTo(finger);
-                }
-            }
+            byte[] fingerprint = File.Exists(fingerFile) ? File.ReadAllBytes(fingerFile) : null;
             var insecureUserName = SecureStringToString(userName);
             var insecurePassword = SecureStringToString(password);
             BaseClient client = ssh ? new SshClient(host.Host, insecureUserName, insecurePassword) : new SftpClient(host.Host, insecureUserName, insecurePassword);
+            ConfigureClient(client);
             bool fingerMatch = true;
             client.HostKeyReceived += (sender, e) =>
             {
-                if (hasFinger)
+                if (fingerprint != null)
                 {
-                    if (!e.FingerPrint.SequenceEqual(finger.GetBuffer().AsSpan(0, e.FingerPrint.Length).ToArray()))
+                    if (!e.FingerPrint.SequenceEqual(fingerprint))
                     {
                         e.CanTrust = false;
                         fingerMatch = false;
@@ -268,18 +303,24 @@ namespace AutoSSH
                 }
                 else
                 {
-                    finger.Write(e.FingerPrint);
                     File.WriteAllBytes(fingerFile, e.FingerPrint);
+                    fingerprint = e.FingerPrint.ToArray();
                 }
             };
-            client.Connect();
-            if (!client.IsConnected || !client.ConnectionInfo.IsAuthenticated)
+            try
             {
-                Console.WriteLine("Failed to connect, finger match: {0}", fingerMatch);
-                return null;
+                client.Connect();
+                if (!client.IsConnected || !client.ConnectionInfo.IsAuthenticated)
+                {
+                    throw new SshConnectionException($"Failed to connect to {host}, finger match: {fingerMatch}");
+                }
+                return client;
             }
-            GC.Collect();
-            return client;
+            catch
+            {
+                client.Dispose();
+                throw;
+            }
         }
 
         private static string BytesToString(long byteCount)
@@ -293,63 +334,75 @@ namespace AutoSSH
             return (Math.Sign(byteCount) * num).ToString() + suf[place];
         }
 
-        private static void CopyTo(this Stream source, Stream destination, Action<ulong> progress = null)
+        // SSH.NET queues progress callbacks on the thread pool, so delivery can be out of order.
+        internal sealed class TransferProgress
         {
-            ulong totalBytes = 0;
-            var buffer = ArrayPool<byte>.Shared.Rent(ushort.MaxValue);
-            try
-            {
-                int read;
-                while ((read = source.Read(buffer, 0, buffer.Length)) != 0)
-                {
-                    if (progress != null)
-                    {
-                        totalBytes += (ulong)read;
-                        progress(totalBytes);
-                    }
+            private long reported;
+            private readonly Action<long> addBytes;
 
-                    destination.Write(buffer, 0, read);
-                }
-            }
-            finally
+            internal TransferProgress(Action<long> addBytes) => this.addBytes = addBytes;
+
+            internal void Report(ulong value)
             {
-                ArrayPool<byte>.Shared.Return(buffer);
+                long progress = checked((long)value);
+                long previous;
+                do
+                {
+                    previous = Interlocked.Read(ref reported);
+                    if (progress <= previous)
+                    {
+                        return;
+                    }
+                }
+                while (Interlocked.CompareExchange(ref reported, progress, previous) != previous);
+                addBytes(progress - previous);
             }
         }
 
-        private static long BackupFile(string root, string remotePath, SftpClient client)
+        private static string BackupFileName(string root, string remotePath)
         {
-            string name = Path.GetFileName(remotePath);
-
             // trim rooted paths, including drive letters
             string localPath = Regex.Replace(remotePath, @"^\/[A-Za-z]\:[/\\]", string.Empty).Trim('/', '\\');
-            string fileName = Path.Combine(root, localPath);
+            return Path.Combine(root, localPath);
+        }
 
+        internal static long BackupFile(string root, string remotePath, ISftpClient client, ISftpFile file = null)
+        {
+            string fileName = BackupFileName(root, remotePath);
             try
             {
-                var file = client.Get(remotePath);
+                file ??= client.Get(remotePath);
                 if (file.IsRegularFile && 
                     (!File.Exists(fileName) || file.LastWriteTimeUtc > File.GetLastWriteTimeUtc(fileName)))
                 {
-                    string tempFile = fileName + ".__TEMP__";
+                    string tempFile = fileName + "." + Guid.NewGuid().ToString("N") + ".__TEMP__";
                     Directory.CreateDirectory(Path.GetDirectoryName(fileName));
-                    using (FileStream stream = File.Create(tempFile))
+                    try
                     {
-                        long prevProgress = 0;
-                        client.DownloadFile(remotePath, stream, (progress) =>
+                        using (FileStream stream = File.Create(tempFile))
                         {
-                            Interlocked.Add(ref bytesDownloaded, ((long)progress - prevProgress));
-                            prevProgress = (long)progress;
-                        });
-                    }
-                    if (File.Exists(tempFile) && new FileInfo(tempFile).Length == file.Length)
-                    {
-                        if (File.Exists(fileName))
-                        {
-                            File.Delete(fileName);
+                            var progress = new TransferProgress(delta => Interlocked.Add(ref bytesDownloaded, delta));
+                            client.DownloadFile(remotePath, stream, progress.Report);
+                            progress.Report((ulong)stream.Length);
                         }
-                        File.Move(tempFile, fileName);
-                        File.SetLastWriteTimeUtc(fileName, file.LastWriteTimeUtc);
+                        if (new FileInfo(tempFile).Length != file.Length)
+                        {
+                            throw new IOException($"Incomplete download of {remotePath}; expected {file.Length} bytes.");
+                        }
+                        File.SetLastWriteTimeUtc(tempFile, file.LastWriteTimeUtc);
+                        File.Move(tempFile, fileName, overwrite: true);
+                    }
+                    finally
+                    {
+                        // A failed transfer must leave the previous backup intact.
+                        try
+                        {
+                            File.Delete(tempFile);
+                        }
+                        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                        {
+                            Console.WriteLine("Unable to remove temporary file {0}: {1}", tempFile, ex.Message);
+                        }
                     }
                 }
                 else
@@ -366,144 +419,220 @@ namespace AutoSSH
             {
                 // OK
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not SshException && ex is not TimeoutException)
             {
                 Console.WriteLine("Error: {0}         ", ex.Message);
             }
             return 0;
         }
 
-        private static long BackupFolder(HostEntry host, string root, string path, SftpClient client, StreamWriter log)
+        private static ISftpFile[] ReadBackupEntries(Func<IEnumerable<ISftpFile>> read, string path, TextWriter log)
         {
-            long size = 0;
-            foreach (string fileOrFolder in path.Split('|').Select(s => s.Trim()).Where(s => s.Length != 0))
+            try { return read().ToArray(); }
+            catch (SftpPathNotFoundException) { }
+            catch (SftpPermissionDeniedException ex)
             {
-                if (!client.Exists(fileOrFolder))
+                log.WriteLine("Error backing up {0}: {1}", path, ex.Message);
+            }
+            catch (Exception ex) when (ex is not SshException && ex is not TimeoutException)
+            {
+                log.WriteLine("Error backing up {0}: {1}", path, ex);
+            }
+            return Array.Empty<ISftpFile>();
+        }
+
+        private static IEnumerable<ISftpFile> EnumerateBackupFiles(HostEntry host, string path,
+            ISftpClient client, TextWriter log, CancellationToken cancellation)
+        {
+            // Only the enumerator uses this session. Listing metadata is sufficient for sync checks.
+            foreach (string root in path.Split('|').Select(s => s.Trim()).Where(s => s.Length != 0))
+            {
+                cancellation.ThrowIfCancellationRequested();
+                var pending = new Stack<ISftpFile>(ReadBackupEntries(() => new[] { client.Get(root) }, root, log));
+                while (pending.Count != 0)
                 {
-                    continue;
+                    cancellation.ThrowIfCancellationRequested();
+                    var entry = pending.Pop();
+                    if (entry.IsRegularFile)
+                    {
+                        yield return entry;
+                    }
+                    else if (entry.IsDirectory)
+                    {
+                        foreach (var child in ReadBackupEntries(() => client.ListDirectory(entry.FullName), entry.FullName, log))
+                        {
+                            if ((child.IsRegularFile || (child.IsDirectory && !child.Name.StartsWith("."))) &&
+                                (host.IgnoreRegex == null || !host.IgnoreRegex.IsMatch(child.FullName)))
+                            {
+                                pending.Push(child);
+                            }
+                        }
+                    }
                 }
-                ISftpFile file;
+            }
+        }
+
+        internal static long BackupFolder(HostEntry host, string root, string path, ISftpClient client, TextWriter log,
+            Func<ISftpClient> createDownloadClient = null, int workers = 4)
+        {
+            if (workers < 1 || workers > 16) throw new ArgumentOutOfRangeException(nameof(workers));
+            long size = 0;
+            using var cancellation = new CancellationTokenSource();
+            IEnumerable<ISftpFile> ChangedFiles()
+            {
+                // Avoid opening download connections for unchanged backups or repeated/overlapping roots.
+                var seen = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var file in EnumerateBackupFiles(host, path, client, log, cancellation.Token))
+                {
+                    if (!seen.Add(file.FullName)) continue;
+                    string localFile = BackupFileName(root, file.FullName);
+                    if (File.Exists(localFile) && file.LastWriteTimeUtc <= File.GetLastWriteTimeUtc(localFile))
+                    {
+                        Interlocked.Add(ref bytesSkipped, file.Length);
+                        Interlocked.Add(ref size, file.Length);
+                    }
+                    else
+                    {
+                        yield return file;
+                    }
+                }
+            }
+
+            if (createDownloadClient == null || workers == 1)
+            {
+                foreach (var file in ChangedFiles())
+                    size += BackupFile(root, file.FullName, client, file);
+            }
+            else
+            {
                 try
                 {
-                    file = client.Get(fileOrFolder);
-                }
-                catch (SftpPathNotFoundException)
-                {
-                    continue;
-                }
-                catch (Exception ex)
-                {
-                    log.WriteLine("Error backing up folder {0}: {1}", fileOrFolder, ex);
-                    continue;
-                }
-                if (file.IsRegularFile)
-                {
-                    Interlocked.Add(ref size, BackupFile(root, file.FullName, client));
-                }
-                else
-                {
-                    try
-                    {
-                        var files = client.ListDirectory(fileOrFolder).Where(f => f.IsRegularFile || (f.IsDirectory && !f.Name.StartsWith("."))).ToArray();
-                        Parallel.ForEach(files.Where(f => f.IsRegularFile && (host.IgnoreRegex == null || !host.IgnoreRegex.IsMatch(f.FullName))), parallelOptions, (_file) =>
+                    // Each worker exclusively owns its client; the original client only scans directories.
+                    Parallel.ForEach(ChangedFiles(),
+                        new ParallelOptions { MaxDegreeOfParallelism = workers, CancellationToken = cancellation.Token },
+                        () => new Lazy<ISftpClient>(createDownloadClient),
+                        (file, state, downloadClient) =>
                         {
-                            Interlocked.Add(ref size, BackupFile(root, _file.FullName, client));
-                        });
-                        Parallel.ForEach(files.Where(f => f.IsDirectory && (host.IgnoreRegex == null || !host.IgnoreRegex.IsMatch(f.FullName))), parallelOptions2, (folder) =>
-                        {
-                            Interlocked.Add(ref size, BackupFolder(host, root, folder.FullName, client, log));
-                        });
-                    }
-                    catch (Exception ex)
-                    {
-                        log.WriteLine("Failed to backup file or folder {0}, error: {1}", fileOrFolder, ex.Message);
-                    }
+                            try
+                            {
+                                cancellation.Token.ThrowIfCancellationRequested();
+                                Interlocked.Add(ref size, BackupFile(root, file.FullName, downloadClient.Value, file));
+                                return downloadClient;
+                            }
+                            catch
+                            {
+                                cancellation.Cancel();
+                                throw;
+                            }
+                        },
+                        downloadClient => { if (downloadClient.IsValueCreated) downloadClient.Value.Dispose(); });
+                }
+                catch (AggregateException ex)
+                {
+                    // Preserve the original session failure instead of reporting sibling cancellation.
+                    Exception error = ex.Flatten().InnerExceptions.FirstOrDefault(e => e is not OperationCanceledException) ?? ex;
+                    ExceptionDispatchInfo.Capture(error).Throw();
                 }
             }
             return size;
         }
 
-        private static long UploadFolder(HostEntry host, string pathInfo, SftpClient client, StreamWriter log)
+        private static void EnsureRemoteDirectory(ISftpClient client, string directory)
+        {
+            if (directory.Length == 0 || directory == "/" || directory == "." || client.Exists(directory))
+            {
+                return;
+            }
+            int separator = directory.LastIndexOf('/');
+            if (separator > 0)
+            {
+                EnsureRemoteDirectory(client, directory.Substring(0, separator));
+            }
+            client.CreateDirectory(directory);
+        }
+
+        internal static long UploadFolder(HostEntry host, string pathInfo, ISftpClient client, TextWriter log)
         {
             long uploadSize = 0;
-            string[] paths = pathInfo.Split(';');
-            string localDir = paths[0];
-            string remoteFolder = paths[1];
-            string[] localFiles = Directory.GetFiles(localDir, "*", SearchOption.AllDirectories);
-            Parallel.ForEach(localFiles, file =>
+            string[] paths = pathInfo.Split(';', 2);
+            if (paths.Length != 2 || string.IsNullOrWhiteSpace(paths[0]) || string.IsNullOrWhiteSpace(paths[1]))
+            {
+                throw new ArgumentException("Upload format is $upload local_folder;remote_folder.");
+            }
+            string localDir = Path.GetFullPath(paths[0].Trim());
+            string remoteFolder = paths[1].Trim().Replace('\\', '/').TrimEnd('/');
+            foreach (string file in Directory.EnumerateFiles(localDir, "*", SearchOption.AllDirectories))
             {
                 if (host.IgnoreRegex != null && host.IgnoreRegex.IsMatch(file))
                 {
-                    return;
+                    continue;
                 }
 
-                var localDirForFile = Path.GetDirectoryName(file);
-                var localFile = Path.GetFileName(file);
-                var remoteDir = Path.Combine(remoteFolder, localDirForFile.Substring(localDir.Length));
-                var remoteFile = remoteDir + "/" + localFile;
-
+                string relativePath = Path.GetRelativePath(localDir, file).Replace('\\', '/');
+                string remoteFile = remoteFolder + "/" + relativePath;
+                string remoteDir = remoteFile.Substring(0, remoteFile.LastIndexOf('/'));
                 try
                 {
-                    long prevProgress = 0;
+                    EnsureRemoteDirectory(client, remoteDir);
                     using var localStream = File.OpenRead(file);
-                    if (!client.Exists(remoteDir))
-                    {
-                        client.CreateDirectory(remoteDir);
-                    }
-                    using var remoteStream = client.OpenWrite(remoteFile);
-                    localStream.CopyTo(remoteStream, bytesUploaded =>
-                    {
-                        Interlocked.Add(ref AutoSSHApp.bytesUploaded, ((long)bytesUploaded - prevProgress));
-                        prevProgress = (long)bytesUploaded;
-                    });
-                    Interlocked.Add(ref uploadSize, prevProgress);
+                    var progress = new TransferProgress(delta => Interlocked.Add(ref bytesUploaded, delta));
+                    client.UploadFile(localStream, remoteFile, true, progress.Report);
+                    progress.Report((ulong)localStream.Length);
+                    uploadSize += localStream.Length;
                 }
-                catch (Exception ex)
+                catch (SftpPermissionDeniedException ex)
                 {
-                    Console.WriteLine("Error uploading file {0} to {1}: {2}", localFiles, remoteFile, ex);
+                    log.WriteLine("Error uploading file {0} to {1}: {2}", file, remoteFile, ex.Message);
                 }
-            });
+                catch (SftpPathNotFoundException ex)
+                {
+                    log.WriteLine("Error uploading file {0} to {1}: {2}", file, remoteFile, ex.Message);
+                }
+                catch (Exception ex) when (ex is not SshException && ex is not TimeoutException)
+                {
+                    log.WriteLine("Error uploading file {0} to {1}: {2}", file, remoteFile, ex);
+                }
+            }
             return uploadSize;
+        }
+
+        internal static string ExpectPrompt(ShellStream stream, Regex prompt, TimeSpan timeout, TextWriter log, string context)
+        {
+            string output = stream.Expect(prompt, timeout);
+            if (output == null)
+            {
+                log.Write(stream.Read());
+                log.Flush();
+                throw new TimeoutException($"Timed out after {timeout.TotalSeconds} seconds waiting for {context}.");
+            }
+            log.Write(output);
+            log.Flush();
+            return output;
         }
 
         private static void ClientLoop(string root, HostEntry host, List<string> commands)
         {
-            bytesDownloaded = 0;
             string logFile = Path.Combine(root, host.Name, "log.txt");
             string backupPath = Path.Combine(root, host.Name, "backup");
             long backupSize = 0;
             long uploadSize = 0;
             Directory.CreateDirectory(Path.GetDirectoryName(logFile));
-            Regex promptRegex = new Regex(@"[$>]");
-            //Regex userRegex = new Regex(@"[$>]");
-            //Regex passwordRegex = new Regex(@"([$#>:])");
             using (StreamWriter writer = File.CreateText(logFile))
             using (SshClient client = (SshClient)Connect(root, host, true))
             using (ShellStream stream = client.CreateShellStream("xterm", 255, 50, 800, 600, 1024, null))
             using (SftpClient sftpClient = (SftpClient)Connect(root, host, false))
             {
-                if (host.IsWindows)
+                ExpectPrompt(stream, host.IsWindows ? windowsPromptRegex : loginPromptRegex, connectionTimeout, writer, "the login prompt");
+                if (!host.IsWindows)
                 {
-                    stream.Expect(">");
-                    while (stream.DataAvailable)
-                    {
-                        writer.Write(stream.Read());
-                    }
-                }
-                else
-                {
-                    stream.Expect(promptRegex);
-                    while (stream.DataAvailable)
-                    {
-                        writer.Write(stream.Read());
-                    }
                     stream.Write("sudo -s\n");
-                    stream.Expect("password");
-                    WriteSecure(password, stream);
-                    stream.Expect("#");
-                    while (stream.DataAvailable)
+                    // sudo may already be authenticated or configured for passwordless access.
+                    string sudoOutput = ExpectPrompt(stream, sudoPromptRegex,
+                        connectionTimeout, writer, "the sudo password or root prompt");
+                    if (!rootPromptRegex.IsMatch(sudoOutput))
                     {
-                        writer.Write(stream.Read());
+                        WriteSecure(password, stream);
+                        ExpectPrompt(stream, rootPromptRegex, connectionTimeout, writer, "the root prompt");
                     }
                 }
                 foreach (string command in commands)
@@ -513,7 +642,8 @@ namespace AutoSSH
                     {
                         if (command.StartsWith("$backup ", StringComparison.OrdinalIgnoreCase))
                         {
-                            backupSize += BackupFolder(host, backupPath, command.Substring(8), sftpClient, writer);
+                            backupSize += BackupFolder(host, backupPath, command.Substring(8), sftpClient, writer,
+                                () => (SftpClient)Connect(root, host, false), downloadWorkers);
                         }
                         else if (command.StartsWith("$upload ", StringComparison.OrdinalIgnoreCase))
                         {
@@ -529,18 +659,8 @@ namespace AutoSSH
                         Console.WriteLine("Execute command {0}", command);
                         stream.Write(command);
                         stream.Write("\n");
-                        if (host.IsWindows)
-                        {
-                            stream.Expect(">");
-                        }
-                        else
-                        {
-                            stream.Expect("#");
-                        }
-                        while (stream.DataAvailable)
-                        {
-                            writer.Write(stream.Read());
-                        }
+                        ExpectPrompt(stream, host.IsWindows ? windowsPromptRegex : rootPromptRegex,
+                            commandTimeout, writer, $"command completion on {host}: {command}");
                     }
                 }
                 writer.Write("logout\n");
@@ -557,21 +677,22 @@ namespace AutoSSH
             }
 
             Console.WriteLine("Process started at {0}", DateTime.Now);
-            ThreadPool.SetMinThreads(1024, 2048);
-            ThreadPool.SetMaxThreads(16384, 32768);
+            bytesDownloaded = 0;
+            bytesUploaded = 0;
+            bytesSkipped = 0;
             Stopwatch stopWatch = Stopwatch.StartNew();
             string commandFile = args.Length > 0 ? args[0] : null;
             string backupFolder = args.Length > 1 ? args[1] : null;
             List<KeyValuePair<HostEntry, List<string>>> commands = Initialize(commandFile, backupFolder);
-            Timer updateTimer = new Timer(new TimerCallback((state) =>
+            using Timer updateTimer = new Timer(new TimerCallback((state) =>
             {
                 Console.Write("Bytes downloaded: {0}, uploaded: {1}, skipped: {2}    \r",
-                    BytesToString(bytesDownloaded), BytesToString(bytesUploaded), BytesToString(bytesSkipped));
+                    BytesToString(Interlocked.Read(ref bytesDownloaded)), BytesToString(Interlocked.Read(ref bytesUploaded)), BytesToString(Interlocked.Read(ref bytesSkipped)));
             }));
 
             // 4x second update rate
             updateTimer.Change(1, 250);
-            Parallel.ForEach(commands, (kv) =>
+            Parallel.ForEach(commands, hostParallelOptions, (kv) =>
             {
                 try
                 {
@@ -582,6 +703,13 @@ namespace AutoSSH
                     Console.WriteLine("Error on host {0}: {1}\r\n", kv.Key.Host, ex);
                 }
             });
+            using (var timerStopped = new ManualResetEvent(false))
+            {
+                if (updateTimer.Dispose(timerStopped))
+                {
+                    timerStopped.WaitOne();
+                }
+            }
             Console.WriteLine("Bytes downloaded: {0}    ", BytesToString(bytesDownloaded));
             Console.WriteLine("Bytes uploaded: {0}   ", BytesToString(bytesUploaded));
             Console.WriteLine("Bytes skipped: {0}   ", BytesToString(bytesSkipped));
