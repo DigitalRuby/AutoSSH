@@ -18,6 +18,8 @@ using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Threading;
 
+using System.Formats.Tar;
+
 using Renci.SshNet;
 using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
@@ -527,12 +529,8 @@ namespace AutoSSH
                         progress.Report((ulong)stream.Length);
                         downloaded = stream.Length;
                     }
-                    // Listing/find size is a snapshot. Live sqlite/log files often grow before EOF.
-                    // SFTP reads until EOF, so only a short read is actually incomplete.
-                    if (downloaded < file.Length)
-                    {
-                        throw new IOException($"Incomplete download of {file.FullName}; got {downloaded} bytes, expected at least {file.Length}.");
-                    }
+                    // Listing/find size is a snapshot. Live json/sqlite/log files grow and shrink.
+                    // SFTP reads until EOF, so a finished transfer is complete even if the size moved.
                     if (downloaded != file.Length)
                     {
                         Diag.Write($"size changed during download {file.FullName} listed={file.Length} got={downloaded}");
@@ -585,7 +583,7 @@ namespace AutoSSH
             }
         }
 
-        private sealed record BackupEntry(string FullName, string Name, bool IsRegularFile,
+        internal sealed record BackupEntry(string FullName, string Name, bool IsRegularFile,
             bool IsDirectory, long Length, DateTime LastWriteTimeUtc);
 
         private static async Task<BackupEntry> ReadBackupRootAsync(ISftpClient client, string path,
@@ -663,6 +661,182 @@ namespace AutoSSH
         }
 
         private static string QuoteUnix(string value) => "'" + value.Replace("'", "'\\''") + "'";
+
+        private static readonly byte[] tarNameNul = { 0 };
+
+        internal static string NormalizeTarEntryName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return "/";
+            name = name.Replace('\\', '/');
+            while (name.StartsWith("./", StringComparison.Ordinal)) name = name[2..];
+            if (name.Length > 1) name = name.TrimEnd('/');
+            if (name.Length == 0) return "/";
+            if (name[0] != '/') name = "/" + name;
+            return name;
+        }
+
+        internal static async Task<long> ExtractTarBackupAsync(string root,
+            IReadOnlyDictionary<string, BackupEntry> files, HashSet<string> remaining, Stream tarStream,
+            CancellationToken cancellation = default)
+        {
+            long extracted = 0;
+            int count = 0;
+            await using TarReader reader = new TarReader(tarStream, leaveOpen: true);
+            while (await reader.GetNextEntryAsync(copyData: false, cancellation) is TarEntry entry)
+            {
+                bool wanted = entry.EntryType is TarEntryType.RegularFile or TarEntryType.V7RegularFile
+                    or TarEntryType.ContiguousFile;
+                string remotePath = wanted ? NormalizeTarEntryName(entry.Name) : null;
+                if (!wanted || remotePath == null || !files.TryGetValue(remotePath, out BackupEntry file) ||
+                    !remaining.Contains(file.FullName))
+                {
+                    if (entry.DataStream != null)
+                    {
+                        await entry.DataStream.CopyToAsync(Stream.Null, cancellation);
+                    }
+                    continue;
+                }
+
+                string fileName = BackupFileName(root, file.FullName);
+                long transferred = 0;
+                long downloaded = 0;
+                bool committed = false;
+                string tempFile = fileName + "." + Guid.NewGuid().ToString("N") + ".__TEMP__";
+                Directory.CreateDirectory(Path.GetDirectoryName(fileName));
+                try
+                {
+                    await using (FileStream stream = OpenLocalTransferStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
+                    {
+                        var progress = new TransferProgress(delta =>
+                        {
+                            Interlocked.Add(ref transferred, delta);
+                            Interlocked.Add(ref bytesDownloaded, delta);
+                        });
+                        if (entry.DataStream != null)
+                        {
+                            await entry.DataStream.CopyToAsync(stream, transferBufferSize, cancellation);
+                        }
+                        await stream.FlushAsync(cancellation);
+                        progress.Report((ulong)stream.Length);
+                        downloaded = stream.Length;
+                    }
+                    if (downloaded != file.Length)
+                    {
+                        Diag.Write($"size changed during download {file.FullName} listed={file.Length} got={downloaded}");
+                    }
+                    File.SetLastWriteTimeUtc(tempFile, file.LastWriteTimeUtc);
+                    File.Move(tempFile, fileName, overwrite: true);
+                    committed = true;
+                    remaining.Remove(file.FullName);
+                    extracted += downloaded;
+                    count++;
+                    if (count == 1 || count % 50 == 0)
+                    {
+                        Diag.Write($"tar extracted {count} files (latest {file.FullName} {BytesToString(downloaded)})");
+                    }
+                }
+                finally
+                {
+                    if (!committed && transferred != 0)
+                    {
+                        Interlocked.Add(ref bytesDownloaded, -transferred);
+                    }
+                    if (!committed)
+                    {
+                        try
+                        {
+                            File.Delete(tempFile);
+                        }
+                        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                        {
+                            Console.WriteLine("Unable to remove temporary file {0}: {1}", tempFile, ex.Message);
+                        }
+                    }
+                }
+            }
+            return extracted;
+        }
+
+        private static async Task WriteTarFileListAsync(SshCommand cmd, IReadOnlyList<BackupEntry> files,
+            CancellationToken cancellation)
+        {
+            await using Stream input = cmd.CreateInputStream();
+            foreach (BackupEntry file in files)
+            {
+                cancellation.ThrowIfCancellationRequested();
+                await input.WriteAsync(Encoding.UTF8.GetBytes(file.FullName), cancellation);
+                await input.WriteAsync(tarNameNul, cancellation);
+            }
+        }
+
+        private static async Task<string> ReadCommandErrorAsync(SshCommand cmd, CancellationToken cancellation)
+        {
+            using StreamReader reader = new StreamReader(cmd.ExtendedOutputStream, Encoding.UTF8,
+                detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
+            return await reader.ReadToEndAsync(cancellation);
+        }
+
+        private static async Task<(List<BackupEntry> leftover, long extracted)> TryDownloadChangedFilesViaTarAsync(
+            HostEntry host, string root, IReadOnlyList<BackupEntry> files, SshClient ssh, CancellationToken cancellation)
+        {
+            if (files.Count == 0) return (new List<BackupEntry>(), 0);
+            var byName = new Dictionary<string, BackupEntry>(files.Count, StringComparer.Ordinal);
+            foreach (BackupEntry file in files) byName.TryAdd(file.FullName, file);
+            var remaining = new HashSet<string>(byName.Keys, StringComparer.Ordinal);
+            long listed = 0;
+            foreach (BackupEntry file in files) listed += file.Length;
+            string op = Diag.Begin($"{host} tar {files.Count} files {BytesToString(listed)}");
+            try
+            {
+                using SshCommand cmd = ssh.CreateCommand(
+                    "tar --null --absolute-names --ignore-failed-read -T - -cf -");
+                cmd.CommandTimeout = commandTimeout;
+                Task executeTask = cmd.ExecuteAsync(cancellation);
+                Task stdinTask = WriteTarFileListAsync(cmd, files, cancellation);
+                Task<string> stderrTask = ReadCommandErrorAsync(cmd, cancellation);
+                long extracted = await ExtractTarBackupAsync(root, byName, remaining, cmd.OutputStream, cancellation);
+                try
+                {
+                    await stdinTask;
+                }
+                catch (Exception ex)
+                {
+                    Diag.Write($"{host} tar stdin {ex.GetType().Name}: {ex.Message}");
+                }
+                try
+                {
+                    await executeTask;
+                }
+                catch (Exception ex) when (extracted != 0)
+                {
+                    Diag.Write($"{host} tar command {ex.GetType().Name}: {ex.Message}");
+                }
+                string stderr = string.Empty;
+                try
+                {
+                    stderr = await stderrTask;
+                }
+                catch (Exception ex)
+                {
+                    Diag.Write($"{host} tar stderr {ex.GetType().Name}: {ex.Message}");
+                }
+                if (stderr.Length > 2048) stderr = stderr[..2048] + "...";
+                var leftover = files.Where(file => remaining.Contains(file.FullName)).ToList();
+                Diag.End(op, $"exit={cmd.ExitStatus} extracted={files.Count - leftover.Count} left={leftover.Count}" +
+                    (stderr.Length == 0 ? "" : " " + stderr.Trim()));
+                return (leftover, extracted);
+            }
+            catch (Exception ex)
+            {
+                Diag.Fail(op, ex);
+                long extracted = 0;
+                foreach (BackupEntry file in files)
+                {
+                    if (!remaining.Contains(file.FullName)) extracted += file.Length;
+                }
+                return (files.Where(file => remaining.Contains(file.FullName)).ToList(), extracted);
+            }
+        }
 
         private static async Task<List<BackupEntry>> TryFindBackupFilesAsync(HostEntry host, string path,
             SshClient ssh, CancellationToken cancellation)
@@ -754,18 +928,22 @@ namespace AutoSSH
             using var cancellation = new CancellationTokenSource();
             var seen = new HashSet<string>(StringComparer.Ordinal);
             string scanOp = Diag.Begin($"{host} backup {path} workers={workers}");
+            List<BackupEntry> foundList = null;
+            if (ssh != null && !host.IsWindows)
+            {
+                foundList = await TryFindBackupFilesAsync(host, path, ssh, cancellation.Token);
+                if (foundList == null)
+                {
+                    Diag.Write($"{host} falling back to SFTP directory walking");
+                }
+            }
 
             async IAsyncEnumerable<BackupEntry> EnumerateAsync()
             {
-                if (ssh != null && !host.IsWindows)
+                if (foundList != null)
                 {
-                    List<BackupEntry> found = await TryFindBackupFilesAsync(host, path, ssh, cancellation.Token);
-                    if (found != null)
-                    {
-                        foreach (BackupEntry file in found) yield return file;
-                        yield break;
-                    }
-                    Diag.Write($"{host} falling back to SFTP directory walking");
+                    foreach (BackupEntry file in foundList) yield return file;
+                    yield break;
                 }
                 await foreach (BackupEntry file in EnumerateBackupFilesAsync(host, path, client, log, cancellation.Token))
                 {
@@ -796,93 +974,130 @@ namespace AutoSSH
                 }
             }
 
-            if (createDownloadClient == null || workers == 1)
+            async IAsyncEnumerable<BackupEntry> RemainingAsync(List<BackupEntry> leftover)
             {
-                try
+                foreach (BackupEntry file in leftover) yield return file;
+            }
+
+            async Task DownloadViaSftpAsync(IAsyncEnumerable<BackupEntry> source, bool countFiles)
+            {
+                if (createDownloadClient == null || workers == 1)
                 {
-                    await foreach (var file in ChangedFilesAsync())
+                    await foreach (var file in source)
                     {
-                        Interlocked.Increment(ref queued);
+                        if (countFiles)
+                        {
+                            int n = Interlocked.Increment(ref queued);
+                            if (n == 1 || n % 50 == 0)
+                            {
+                                Diag.Write($"{host} queued {n} downloads (latest {file.FullName} {BytesToString(file.Length)})");
+                            }
+                        }
                         size += await BackupFileAsync(root, file, client, cancellation.Token);
                     }
-                    Diag.End(scanOp, $"queued={queued} skipped={skipped} size={BytesToString(size)}");
-                    return size;
+                    return;
                 }
-                catch (Exception ex)
-                {
-                    Diag.Fail(scanOp, ex);
-                    throw;
-                }
-            }
 
-            // List on the original session while workers download on their own connections.
-            // Transfers start as soon as files are found instead of waiting for the whole tree.
-            var files = Channel.CreateBounded<BackupEntry>(new BoundedChannelOptions(32)
-            {
-                SingleWriter = true,
-                SingleReader = false,
-                FullMode = BoundedChannelFullMode.Wait
-            });
-
-            async Task ScanAsync()
-            {
-                try
+                var files = Channel.CreateBounded<BackupEntry>(new BoundedChannelOptions(32)
                 {
-                    await foreach (var file in ChangedFilesAsync())
+                    SingleWriter = true,
+                    SingleReader = false,
+                    FullMode = BoundedChannelFullMode.Wait
+                });
+
+                async Task ScanAsync()
+                {
+                    try
                     {
-                        int n = Interlocked.Increment(ref queued);
-                        if (n == 1 || n % 50 == 0)
+                        await foreach (var file in source)
                         {
-                            Diag.Write($"{host} queued {n} downloads (latest {file.FullName} {BytesToString(file.Length)})");
+                            if (countFiles)
+                            {
+                                int n = Interlocked.Increment(ref queued);
+                                if (n == 1 || n % 50 == 0)
+                                {
+                                    Diag.Write($"{host} queued {n} downloads (latest {file.FullName} {BytesToString(file.Length)})");
+                                }
+                            }
+                            var wait = Stopwatch.StartNew();
+                            await files.Writer.WriteAsync(file, cancellation.Token);
+                            if (wait.ElapsedMilliseconds >= 500)
+                            {
+                                Diag.Write($"{host} download queue blocked {wait.ElapsedMilliseconds}ms on {file.FullName}");
+                            }
                         }
-                        var wait = Stopwatch.StartNew();
-                        await files.Writer.WriteAsync(file, cancellation.Token);
-                        if (wait.ElapsedMilliseconds >= 500)
+                        files.Writer.TryComplete();
+                        if (countFiles)
                         {
-                            Diag.Write($"{host} download queue blocked {wait.ElapsedMilliseconds}ms on {file.FullName}");
+                            Diag.Write($"{host} scan complete queued={queued} skipped={skipped}");
                         }
                     }
-                    files.Writer.TryComplete();
-                    Diag.Write($"{host} scan complete queued={queued} skipped={skipped}");
-                }
-                catch (Exception ex)
-                {
-                    files.Writer.TryComplete(ex is OperationCanceledException ? null : ex);
-                    cancellation.Cancel();
-                    throw;
-                }
-            }
-
-            async Task DownloadWorkerAsync()
-            {
-                ISftpClient downloadClient = null;
-                try
-                {
-                    await foreach (var file in files.Reader.ReadAllAsync(cancellation.Token))
+                    catch (Exception ex)
                     {
-                        try
-                        {
-                            downloadClient ??= await createDownloadClient();
-                            Interlocked.Add(ref size,
-                                await BackupFileAsync(root, file, downloadClient, cancellation.Token));
-                        }
-                        catch
-                        {
-                            cancellation.Cancel();
-                            throw;
-                        }
+                        files.Writer.TryComplete(ex is OperationCanceledException ? null : ex);
+                        cancellation.Cancel();
+                        throw;
                     }
                 }
-                finally
+
+                async Task DownloadWorkerAsync()
                 {
-                    downloadClient?.Dispose();
+                    ISftpClient downloadClient = null;
+                    try
+                    {
+                        await foreach (var file in files.Reader.ReadAllAsync(cancellation.Token))
+                        {
+                            try
+                            {
+                                downloadClient ??= await createDownloadClient();
+                                Interlocked.Add(ref size,
+                                    await BackupFileAsync(root, file, downloadClient, cancellation.Token));
+                            }
+                            catch
+                            {
+                                cancellation.Cancel();
+                                throw;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        downloadClient?.Dispose();
+                    }
                 }
+
+                var workerTasks = Enumerable.Range(0, workers).Select(_ => DownloadWorkerAsync()).ToArray();
+                await WhenAllPreferSessionErrors(new Task[] { ScanAsync() }.Concat(workerTasks).ToArray());
             }
 
-            var workerTasks = Enumerable.Range(0, workers).Select(_ => DownloadWorkerAsync()).ToArray();
             try
             {
-                await WhenAllPreferSessionErrors(new Task[] { ScanAsync() }.Concat(workerTasks).ToArray());
+                IAsyncEnumerable<BackupEntry> source = ChangedFilesAsync();
+                bool countFiles = true;
+                if (foundList != null && ssh != null)
+                {
+                    var changed = new List<BackupEntry>();
+                    await foreach (var file in ChangedFilesAsync()) changed.Add(file);
+                    queued = changed.Count;
+                    Diag.Write($"{host} scan complete queued={queued} skipped={skipped}");
+                    if (changed.Count == 0)
+                    {
+                        Diag.End(scanOp, $"queued={queued} skipped={skipped} size={BytesToString(size)}");
+                        return size;
+                    }
+                    (List<BackupEntry> leftover, long extracted) = await TryDownloadChangedFilesViaTarAsync(
+                        host, root, changed, ssh, cancellation.Token);
+                    size += extracted;
+                    if (leftover.Count == 0)
+                    {
+                        Diag.End(scanOp, $"queued={queued} skipped={skipped} size={BytesToString(size)}");
+                        return size;
+                    }
+                    Diag.Write($"{host} tar left {leftover.Count} files, falling back to SFTP");
+                    source = RemainingAsync(leftover);
+                    countFiles = false;
+                }
+                await DownloadViaSftpAsync(source, countFiles);
                 Diag.End(scanOp, $"queued={queued} skipped={skipped} size={BytesToString(size)}");
                 return size;
             }

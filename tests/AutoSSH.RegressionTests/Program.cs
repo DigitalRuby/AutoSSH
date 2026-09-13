@@ -1,3 +1,4 @@
+using System.Formats.Tar;
 using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -16,6 +17,8 @@ var tests = new (string Name, Action Run)[]
     ("Concurrent task failures propagate and dispose worker sessions", ParallelBackupFailure),
     ("Failed and incomplete downloads preserve the previous backup", FailedDownload),
     ("Downloads that grew after listing still commit the complete file", GrewAfterListing),
+    ("Downloads that shrank after listing still commit the complete file", ShrunkAfterListing),
+    ("Tar extracts listed files, skips extra members, and keeps grown sizes", TarExtract),
     ("Session failures escape every backup stage immediately", BackupSessionFailures),
     ("Uploads retain the remote root, create parents, and truncate existing files", UploadTree),
     ("Session failures escape every upload stage immediately", UploadSessionFailures),
@@ -231,6 +234,53 @@ static void GrewAfterListing()
     Check(File.ReadAllText(System.IO.Path.Combine(temp.Path, "data/live.log")) == "0123456789", "Grew file was truncated.");
 }
 
+static void ShrunkAfterListing()
+{
+    using var temp = new TempFolder();
+    var remote = new FakeSftp();
+    remote.AddDirectory("/data");
+    remote.AddFile("/data/live.json", "0123456789");
+    remote.ListLengthAdjust = 4;
+    long size = BackupFolder(Host(), temp.Path, "/data", remote.Client, TextWriter.Null);
+    Check(size == 10, "Shrunk file was rejected as incomplete.");
+    Check(File.ReadAllText(System.IO.Path.Combine(temp.Path, "data/live.json")) == "0123456789", "Shrunk file was discarded.");
+}
+
+static void TarExtract()
+{
+    Check(AutoSSHApp.NormalizeTarEntryName("opt/app/file.txt") == "/opt/app/file.txt", "Relative tar names should map to remote paths.");
+    Check(AutoSSHApp.NormalizeTarEntryName("/opt/app/file.txt") == "/opt/app/file.txt", "Absolute tar names should stay absolute.");
+    Check(AutoSSHApp.NormalizeTarEntryName("./opt/app/file.txt") == "/opt/app/file.txt", "Tar ./ prefixes should be stripped.");
+    using var temp = new TempFolder();
+    var timestamp = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
+    var listed = new AutoSSHApp.BackupEntry("/opt/app/file.txt", "file.txt", true, false, 3, timestamp);
+    var files = new Dictionary<string, AutoSSHApp.BackupEntry> { [listed.FullName] = listed };
+    var remaining = new HashSet<string> { listed.FullName };
+    using var tar = new MemoryStream();
+    using (var writer = new TarWriter(tar, leaveOpen: true))
+    {
+        var wanted = new PaxTarEntry(TarEntryType.RegularFile, "opt/app/file.txt")
+        {
+            DataStream = new MemoryStream("hello world"u8.ToArray()),
+            ModificationTime = timestamp
+        };
+        writer.WriteEntry(wanted);
+        var extra = new PaxTarEntry(TarEntryType.RegularFile, "etc/passwd")
+        {
+            DataStream = new MemoryStream("secret"u8.ToArray())
+        };
+        writer.WriteEntry(extra);
+    }
+    tar.Position = 0;
+    long bytes = AutoSSHApp.ExtractTarBackupAsync(temp.Path, files, remaining, tar).GetAwaiter().GetResult();
+    Check(bytes == 11, "Grew tar file was rejected as incomplete.");
+    Check(remaining.Count == 0, "Listed tar file was not marked extracted.");
+    string local = System.IO.Path.Combine(temp.Path, "opt/app/file.txt");
+    Check(File.ReadAllText(local) == "hello world", "Tar extract wrote the wrong contents.");
+    Check(File.GetLastWriteTimeUtc(local) == timestamp, "Tar extract did not restore the listed timestamp.");
+    Check(!File.Exists(System.IO.Path.Combine(temp.Path, "etc/passwd")), "Unlisted tar member was extracted.");
+}
+
 static void BackupSessionFailures()
 {
     foreach (string operation in new[] { "Get", "ListDirectory", "DownloadFile" })
@@ -369,6 +419,7 @@ sealed class FakeSftp
         byte[] bytes = content[path];
         await output.WriteAsync(bytes.AsMemory(0, PartialDownload ? 1 : bytes.Length));
         if (StallDownload) throw new SshOperationTimeoutException("stalled download");
+        if (PartialDownload) throw new IOException("truncated download");
     }
 
     async Task<bool> ExistsAsync(string path)
