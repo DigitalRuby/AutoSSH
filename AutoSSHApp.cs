@@ -506,6 +506,7 @@ namespace AutoSSH
         {
             string fileName = BackupFileName(root, file.FullName);
             long transferred = 0;
+            long downloaded = 0;
             bool committed = false;
             string op = Diag.Begin($"download {file.FullName} {BytesToString(file.Length)}");
             try
@@ -522,17 +523,25 @@ namespace AutoSSH
                             Interlocked.Add(ref bytesDownloaded, delta);
                         });
                         await client.DownloadFileAsync(file.FullName, stream, progress, cancellation);
+                        await stream.FlushAsync(cancellation);
                         progress.Report((ulong)stream.Length);
+                        downloaded = stream.Length;
                     }
-                    if (new FileInfo(tempFile).Length != file.Length)
+                    // Listing/find size is a snapshot. Live sqlite/log files often grow before EOF.
+                    // SFTP reads until EOF, so only a short read is actually incomplete.
+                    if (downloaded < file.Length)
                     {
-                        throw new IOException($"Incomplete download of {file.FullName}; expected {file.Length} bytes.");
+                        throw new IOException($"Incomplete download of {file.FullName}; got {downloaded} bytes, expected at least {file.Length}.");
+                    }
+                    if (downloaded != file.Length)
+                    {
+                        Diag.Write($"size changed during download {file.FullName} listed={file.Length} got={downloaded}");
                     }
                     File.SetLastWriteTimeUtc(tempFile, file.LastWriteTimeUtc);
                     File.Move(tempFile, fileName, overwrite: true);
                     committed = true;
-                    Diag.End(op);
-                    return file.Length;
+                    Diag.End(op, BytesToString(downloaded));
+                    return downloaded;
                 }
                 finally
                 {

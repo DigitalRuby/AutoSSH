@@ -15,6 +15,7 @@ var tests = new (string Name, Action Run)[]
     ("Downloads start before the directory scan finishes", OverlappingScanAndDownload),
     ("Concurrent task failures propagate and dispose worker sessions", ParallelBackupFailure),
     ("Failed and incomplete downloads preserve the previous backup", FailedDownload),
+    ("Downloads that grew after listing still commit the complete file", GrewAfterListing),
     ("Session failures escape every backup stage immediately", BackupSessionFailures),
     ("Uploads retain the remote root, create parents, and truncate existing files", UploadTree),
     ("Session failures escape every upload stage immediately", UploadSessionFailures),
@@ -218,6 +219,18 @@ static void FailedDownload()
     }
 }
 
+static void GrewAfterListing()
+{
+    using var temp = new TempFolder();
+    var remote = new FakeSftp();
+    remote.AddDirectory("/data");
+    remote.AddFile("/data/live.log", "0123456789");
+    remote.ListLengthAdjust = -4;
+    long size = BackupFolder(Host(), temp.Path, "/data", remote.Client, TextWriter.Null);
+    Check(size == 10, "Grew file was rejected as incomplete.");
+    Check(File.ReadAllText(System.IO.Path.Combine(temp.Path, "data/live.log")) == "0123456789", "Grew file was truncated.");
+}
+
 static void BackupSessionFailures()
 {
     foreach (string operation in new[] { "Get", "ListDirectory", "DownloadFile" })
@@ -315,6 +328,7 @@ sealed class FakeSftp
     public Action<string> Before;
     public bool PartialDownload, StallDownload;
     public int Downloads, Uploads, MaxActive, Gets, Listings, Disposals;
+    public int ListLengthAdjust;
     int active;
 
     public FakeSftp() => Client = StubProxy.Make<ISftpClient>(Invoke);
@@ -329,7 +343,7 @@ sealed class FakeSftp
             "get_Name" => path[(path.LastIndexOf('/') + 1)..],
             "get_IsDirectory" => bytes == null,
             "get_IsRegularFile" => bytes != null,
-            "get_Length" => (long)(bytes?.Length ?? 0),
+            "get_Length" => (long)((bytes?.Length ?? 0) + ListLengthAdjust),
             "get_LastWriteTimeUtc" => Timestamp,
             _ => throw new NotSupportedException(method.Name)
         });
