@@ -1,8 +1,10 @@
 ﻿#region Imports
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.ExceptionServices;
@@ -79,6 +81,99 @@ namespace AutoSSH
             {
                 sftpClient.OperationTimeout = operationTimeout;
                 sftpClient.BufferSize = sftpBufferSize;
+            }
+        }
+
+        private static class Diag
+        {
+            private static readonly ConcurrentDictionary<string, (string Op, long Start)> inflight = new();
+            private static readonly object gate = new();
+            private static StreamWriter writer;
+            private static Stopwatch clock;
+            private static long nextId;
+
+            internal static string Path { get; private set; }
+
+            internal static void Start()
+            {
+                string dir = System.IO.Path.GetDirectoryName(Environment.ProcessPath);
+                if (string.IsNullOrEmpty(dir)) dir = AppContext.BaseDirectory;
+                Directory.CreateDirectory(dir);
+                Path = System.IO.Path.Combine(dir, "AutoSSH.log");
+                clock = Stopwatch.StartNew();
+                var stream = new FileStream(Path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+                lock (gate)
+                {
+                    writer = new StreamWriter(stream) { AutoFlush = true };
+                }
+                Write($"==== AutoSSH {DateTime.Now:yyyy-MM-dd HH:mm:ss} pid={Environment.ProcessId} ====");
+                Write("exe=" + (Environment.ProcessPath ?? "(unknown)"));
+                Write("log=" + Path);
+                Write($"hosts={hostWorkers} downloadWorkers={downloadWorkers} sftpTimeout={operationTimeout.TotalSeconds}s commandTimeout={commandTimeout.TotalSeconds}s");
+            }
+
+            internal static void Stop()
+            {
+                Write("==== finished ====");
+                lock (gate)
+                {
+                    writer?.Dispose();
+                    writer = null;
+                }
+            }
+
+            internal static void Write(string message)
+            {
+                lock (gate)
+                {
+                    if (writer == null) return;
+                    writer.WriteLine($"{DateTime.Now:HH:mm:ss.fff} +{clock.Elapsed:hh\\:mm\\:ss\\.fff} t{Environment.CurrentManagedThreadId} {message}");
+                }
+            }
+
+            internal static string Begin(string op)
+            {
+                if (writer == null) return null;
+                string key = Interlocked.Increment(ref nextId).ToString();
+                inflight[key] = (op, Stopwatch.GetTimestamp());
+                Write($"BEGIN [{key}] {op}");
+                return key;
+            }
+
+            internal static void End(string key, string extra = null)
+            {
+                if (key == null) return;
+                string suffix = extra == null ? "" : " " + extra;
+                if (inflight.TryRemove(key, out var a))
+                {
+                    double ms = (Stopwatch.GetTimestamp() - a.Start) * 1000.0 / Stopwatch.Frequency;
+                    Write($"END   [{key}] {a.Op} {ms:0}ms{suffix}");
+                }
+                else
+                {
+                    Write($"END   [{key}]{suffix}");
+                }
+            }
+
+            internal static void Fail(string key, Exception ex)
+            {
+                Write($"FAIL  [{key ?? "?"}] {ex.GetType().Name}: {ex.Message}");
+                End(key, "FAILED");
+            }
+
+            internal static void Heartbeat()
+            {
+                if (writer == null) return;
+                var ops = inflight.Select(kv =>
+                {
+                    double sec = (Stopwatch.GetTimestamp() - kv.Value.Start) / (double)Stopwatch.Frequency;
+                    return $"{kv.Value.Op} ({sec:0.0}s)";
+                }).OrderByDescending(s => s).ToArray();
+                Write($"HEART down={BytesToString(Interlocked.Read(ref bytesDownloaded))} up={BytesToString(Interlocked.Read(ref bytesUploaded))} skip={BytesToString(Interlocked.Read(ref bytesSkipped))} inflight={ops.Length}");
+                foreach (string op in ops)
+                {
+                    Write("  ... " + op);
+                }
             }
         }
         // Accept trailing terminal color/reset sequences as well as plain prompts.
@@ -288,6 +383,7 @@ namespace AutoSSH
         private static async Task<BaseClient> ConnectAsync(string root, HostEntry host, bool ssh)
         {
             Console.WriteLine("Connecting to {0} with type {1}", host, ssh ? "SSH" : "SFTP");
+            string op = Diag.Begin($"{host} connect {(ssh ? "SSH" : "SFTP")}");
             root = Path.Combine(root, host.Name);
             Directory.CreateDirectory(root);
             string fingerFile = Path.Combine(root, "finger.key");
@@ -320,10 +416,12 @@ namespace AutoSSH
                 {
                     throw new SshConnectionException($"Failed to connect to {host}, finger match: {fingerMatch}");
                 }
+                Diag.End(op, fingerMatch ? "ok" : "fingerprint-mismatch");
                 return client;
             }
-            catch
+            catch (Exception ex)
             {
+                Diag.Fail(op, ex);
                 client.Dispose();
                 throw;
             }
@@ -409,6 +507,7 @@ namespace AutoSSH
             string fileName = BackupFileName(root, file.FullName);
             long transferred = 0;
             bool committed = false;
+            string op = Diag.Begin($"download {file.FullName} {BytesToString(file.Length)}");
             try
             {
                 string tempFile = fileName + "." + Guid.NewGuid().ToString("N") + ".__TEMP__";
@@ -432,6 +531,7 @@ namespace AutoSSH
                     File.SetLastWriteTimeUtc(tempFile, file.LastWriteTimeUtc);
                     File.Move(tempFile, fileName, overwrite: true);
                     committed = true;
+                    Diag.End(op);
                     return file.Length;
                 }
                 finally
@@ -448,16 +548,24 @@ namespace AutoSSH
             }
             catch (SftpPathNotFoundException)
             {
+                Diag.End(op, "missing");
                 return 0;
             }
             catch (SftpPermissionDeniedException)
             {
+                Diag.End(op, "denied");
                 return 0;
             }
             catch (Exception ex) when (ex is not SshException && ex is not TimeoutException && ex is not OperationCanceledException)
             {
                 Console.WriteLine("Error: {0}         ", ex.Message);
+                Diag.Fail(op, ex);
                 return 0;
+            }
+            catch (Exception ex)
+            {
+                Diag.Fail(op, ex);
+                throw;
             }
             finally
             {
@@ -480,7 +588,10 @@ namespace AutoSSH
                 return new BackupEntry(path, Path.GetFileName(path.TrimEnd('/', '\\')),
                     attributes.IsRegularFile, attributes.IsDirectory, attributes.Size, attributes.LastWriteTimeUtc);
             }
-            catch (SftpPathNotFoundException) { }
+            catch (SftpPathNotFoundException)
+            {
+                Diag.Write("stat missing " + path);
+            }
             catch (SftpPermissionDeniedException ex)
             {
                 log.WriteLine("Error backing up {0}: {1}", path, ex.Message);
@@ -510,6 +621,7 @@ namespace AutoSSH
             TextWriter log, CancellationToken cancellation)
         {
             var entries = new List<BackupEntry>();
+            string op = Diag.Begin("list " + path);
             try
             {
                 await foreach (var file in client.ListDirectoryAsync(path, cancellation))
@@ -517,17 +629,76 @@ namespace AutoSSH
                     entries.Add(new BackupEntry(file.FullName, file.Name, file.IsRegularFile,
                         file.IsDirectory, file.Length, file.LastWriteTimeUtc));
                 }
+                Diag.End(op, entries.Count + " entries");
             }
-            catch (SftpPathNotFoundException) { }
+            catch (SftpPathNotFoundException)
+            {
+                Diag.End(op, "missing");
+            }
             catch (SftpPermissionDeniedException ex)
             {
+                Diag.Fail(op, ex);
                 log.WriteLine("Error backing up {0}: {1}", path, ex.Message);
             }
             catch (Exception ex) when (ex is not SshException && ex is not TimeoutException && ex is not OperationCanceledException)
             {
+                Diag.Fail(op, ex);
                 log.WriteLine("Error backing up {0}: {1}", path, ex);
             }
+            catch (Exception ex)
+            {
+                Diag.Fail(op, ex);
+                throw;
+            }
             return entries;
+        }
+
+        private static string QuoteUnix(string value) => "'" + value.Replace("'", "'\\''") + "'";
+
+        private static async Task<List<BackupEntry>> TryFindBackupFilesAsync(HostEntry host, string path,
+            SshClient ssh, CancellationToken cancellation)
+        {
+            string[] roots = path.Split('|').Select(s => s.Trim()).Where(s => s.Length != 0).ToArray();
+            if (roots.Length == 0) return new List<BackupEntry>();
+            string command = "find " + string.Join(" ", roots.Select(QuoteUnix)) +
+                " -name '.*' -type d -prune -o -type f -printf '%T@\\t%s\\t%p\\n'";
+            string op = Diag.Begin($"{host} find {path}");
+            try
+            {
+                using SshCommand cmd = ssh.CreateCommand(command);
+                cmd.CommandTimeout = commandTimeout;
+                await cmd.ExecuteAsync(cancellation);
+                string error = cmd.Error ?? string.Empty;
+                if (error.Contains("unknown predicate", StringComparison.OrdinalIgnoreCase) ||
+                    error.Contains("illegal option", StringComparison.OrdinalIgnoreCase) ||
+                    error.Contains("unrecognized", StringComparison.OrdinalIgnoreCase))
+                {
+                    Diag.End(op, "unsupported find, fallback to SFTP");
+                    return null;
+                }
+                var files = new List<BackupEntry>();
+                using StringReader reader = new StringReader(cmd.Result ?? string.Empty);
+                for (string line = reader.ReadLine(); line != null; line = reader.ReadLine())
+                {
+                    int tab1 = line.IndexOf('\t');
+                    int tab2 = tab1 < 0 ? -1 : line.IndexOf('\t', tab1 + 1);
+                    if (tab2 < 0) continue;
+                    if (!double.TryParse(line.AsSpan(0, tab1), NumberStyles.Float, CultureInfo.InvariantCulture, out double unix)) continue;
+                    if (!long.TryParse(line.AsSpan(tab1 + 1, tab2 - tab1 - 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out long size)) continue;
+                    string fullName = line[(tab2 + 1)..];
+                    if (fullName.Length == 0) continue;
+                    if (host.IgnoreRegex != null && host.IgnoreRegex.IsMatch(fullName)) continue;
+                    string name = fullName[(fullName.LastIndexOf('/') + 1)..];
+                    files.Add(new BackupEntry(fullName, name, true, false, size, DateTime.UnixEpoch.AddSeconds(unix)));
+                }
+                Diag.End(op, $"{files.Count} files exit={cmd.ExitStatus}");
+                return files;
+            }
+            catch (Exception ex)
+            {
+                Diag.Fail(op, ex);
+                return null;
+            }
         }
 
         private static async IAsyncEnumerable<BackupEntry> EnumerateBackupFilesAsync(HostEntry host, string path,
@@ -564,16 +735,38 @@ namespace AutoSSH
         }
 
         internal static async Task<long> BackupFolderAsync(HostEntry host, string root, string path,
-            ISftpClient client, TextWriter log, Func<Task<ISftpClient>> createDownloadClient = null, int workers = 4)
+            ISftpClient client, TextWriter log, Func<Task<ISftpClient>> createDownloadClient = null, int workers = 4,
+            SshClient ssh = null)
         {
             if (workers < 1 || workers > 16) throw new ArgumentOutOfRangeException(nameof(workers));
             long size = 0;
+            int queued = 0;
+            int skipped = 0;
             using var cancellation = new CancellationTokenSource();
             var seen = new HashSet<string>(StringComparer.Ordinal);
+            string scanOp = Diag.Begin($"{host} backup {path} workers={workers}");
+
+            async IAsyncEnumerable<BackupEntry> EnumerateAsync()
+            {
+                if (ssh != null && !host.IsWindows)
+                {
+                    List<BackupEntry> found = await TryFindBackupFilesAsync(host, path, ssh, cancellation.Token);
+                    if (found != null)
+                    {
+                        foreach (BackupEntry file in found) yield return file;
+                        yield break;
+                    }
+                    Diag.Write($"{host} falling back to SFTP directory walking");
+                }
+                await foreach (BackupEntry file in EnumerateBackupFilesAsync(host, path, client, log, cancellation.Token))
+                {
+                    yield return file;
+                }
+            }
 
             async IAsyncEnumerable<BackupEntry> ChangedFilesAsync()
             {
-                await foreach (var file in EnumerateBackupFilesAsync(host, path, client, log, cancellation.Token))
+                await foreach (var file in EnumerateAsync())
                 {
                     if (!seen.Add(file.FullName)) continue;
                     string localFile = BackupFileName(root, file.FullName);
@@ -581,6 +774,11 @@ namespace AutoSSH
                     {
                         Interlocked.Add(ref bytesSkipped, file.Length);
                         Interlocked.Add(ref size, file.Length);
+                        int n = Interlocked.Increment(ref skipped);
+                        if (n == 1 || n % 200 == 0)
+                        {
+                            Diag.Write($"{host} skipped {n} files (latest {file.FullName})");
+                        }
                     }
                     else
                     {
@@ -591,9 +789,21 @@ namespace AutoSSH
 
             if (createDownloadClient == null || workers == 1)
             {
-                await foreach (var file in ChangedFilesAsync())
-                    size += await BackupFileAsync(root, file, client, cancellation.Token);
-                return size;
+                try
+                {
+                    await foreach (var file in ChangedFilesAsync())
+                    {
+                        Interlocked.Increment(ref queued);
+                        size += await BackupFileAsync(root, file, client, cancellation.Token);
+                    }
+                    Diag.End(scanOp, $"queued={queued} skipped={skipped} size={BytesToString(size)}");
+                    return size;
+                }
+                catch (Exception ex)
+                {
+                    Diag.Fail(scanOp, ex);
+                    throw;
+                }
             }
 
             // List on the original session while workers download on their own connections.
@@ -611,9 +821,20 @@ namespace AutoSSH
                 {
                     await foreach (var file in ChangedFilesAsync())
                     {
+                        int n = Interlocked.Increment(ref queued);
+                        if (n == 1 || n % 50 == 0)
+                        {
+                            Diag.Write($"{host} queued {n} downloads (latest {file.FullName} {BytesToString(file.Length)})");
+                        }
+                        var wait = Stopwatch.StartNew();
                         await files.Writer.WriteAsync(file, cancellation.Token);
+                        if (wait.ElapsedMilliseconds >= 500)
+                        {
+                            Diag.Write($"{host} download queue blocked {wait.ElapsedMilliseconds}ms on {file.FullName}");
+                        }
                     }
                     files.Writer.TryComplete();
+                    Diag.Write($"{host} scan complete queued={queued} skipped={skipped}");
                 }
                 catch (Exception ex)
                 {
@@ -650,8 +871,17 @@ namespace AutoSSH
             }
 
             var workerTasks = Enumerable.Range(0, workers).Select(_ => DownloadWorkerAsync()).ToArray();
-            await WhenAllPreferSessionErrors(new Task[] { ScanAsync() }.Concat(workerTasks).ToArray());
-            return size;
+            try
+            {
+                await WhenAllPreferSessionErrors(new Task[] { ScanAsync() }.Concat(workerTasks).ToArray());
+                Diag.End(scanOp, $"queued={queued} skipped={skipped} size={BytesToString(size)}");
+                return size;
+            }
+            catch (Exception ex)
+            {
+                Diag.Fail(scanOp, ex);
+                throw;
+            }
         }
 
         private static async Task EnsureRemoteDirectoryAsync(ISftpClient client, string directory,
@@ -687,6 +917,8 @@ namespace AutoSSH
             string localDir = Path.GetFullPath(paths[0].Trim());
             string remoteFolder = paths[1].Trim().Replace('\\', '/').TrimEnd('/');
             var existingDirectories = new HashSet<string>(StringComparer.Ordinal);
+            string op = Diag.Begin($"{host} upload {localDir} -> {remoteFolder}");
+            int uploaded = 0;
             foreach (string file in Directory.EnumerateFiles(localDir, "*", SearchOption.AllDirectories))
             {
                 if (host.IgnoreRegex != null && host.IgnoreRegex.IsMatch(file))
@@ -697,6 +929,7 @@ namespace AutoSSH
                 string relativePath = Path.GetRelativePath(localDir, file).Replace('\\', '/');
                 string remoteFile = remoteFolder + "/" + relativePath;
                 string remoteDir = remoteFile.Substring(0, remoteFile.LastIndexOf('/'));
+                string fileOp = Diag.Begin($"upload {file} -> {remoteFile}");
                 try
                 {
                     await EnsureRemoteDirectoryAsync(client, remoteDir, existingDirectories, cancellation);
@@ -705,34 +938,50 @@ namespace AutoSSH
                     await client.UploadFileAsync(localStream, remoteFile, true, progress, cancellation);
                     progress.Report((ulong)localStream.Length);
                     uploadSize += localStream.Length;
+                    uploaded++;
+                    Diag.End(fileOp, BytesToString(localStream.Length));
                 }
                 catch (SftpPermissionDeniedException ex)
                 {
+                    Diag.Fail(fileOp, ex);
                     log.WriteLine("Error uploading file {0} to {1}: {2}", file, remoteFile, ex.Message);
                 }
                 catch (SftpPathNotFoundException ex)
                 {
+                    Diag.Fail(fileOp, ex);
                     log.WriteLine("Error uploading file {0} to {1}: {2}", file, remoteFile, ex.Message);
                 }
                 catch (Exception ex) when (ex is not SshException && ex is not TimeoutException && ex is not OperationCanceledException)
                 {
+                    Diag.Fail(fileOp, ex);
                     log.WriteLine("Error uploading file {0} to {1}: {2}", file, remoteFile, ex);
                 }
+                catch (Exception ex)
+                {
+                    Diag.Fail(fileOp, ex);
+                    Diag.Fail(op, ex);
+                    throw;
+                }
             }
+            Diag.End(op, $"files={uploaded} size={BytesToString(uploadSize)}");
             return uploadSize;
         }
 
         internal static string ExpectPrompt(ShellStream stream, Regex prompt, TimeSpan timeout, TextWriter log, string context)
         {
+            string op = Diag.Begin($"wait {context} timeout={timeout.TotalSeconds}s");
             string output = stream.Expect(prompt, timeout);
             if (output == null)
             {
                 log.Write(stream.Read());
                 log.Flush();
-                throw new TimeoutException($"Timed out after {timeout.TotalSeconds} seconds waiting for {context}.");
+                var ex = new TimeoutException($"Timed out after {timeout.TotalSeconds} seconds waiting for {context}.");
+                Diag.Fail(op, ex);
+                throw ex;
             }
             log.Write(output);
             log.Flush();
+            Diag.End(op, output.Length + " chars");
             return output;
         }
 
@@ -743,6 +992,9 @@ namespace AutoSSH
             long backupSize = 0;
             long uploadSize = 0;
             Directory.CreateDirectory(Path.GetDirectoryName(logFile));
+            string loopOp = Diag.Begin($"{host} host loop commands={commands.Count}");
+            try
+            {
             using (StreamWriter writer = File.CreateText(logFile))
             using (SshClient client = (SshClient)await ConnectAsync(root, host, true))
             using (ShellStream stream = client.CreateShellStream("xterm", 255, 50, 800, 600, 1024, null))
@@ -764,12 +1016,13 @@ namespace AutoSSH
                 foreach (string command in commands)
                 {
                     writer.WriteLine(command);
+                    Diag.Write($"{host} command {command}");
                     if (command.StartsWith('$'))
                     {
                         if (command.StartsWith("$backup ", StringComparison.OrdinalIgnoreCase))
                         {
                             backupSize += await BackupFolderAsync(host, backupPath, command.Substring(8), sftpClient, writer,
-                                async () => (SftpClient)await ConnectAsync(root, host, false), downloadWorkers);
+                                async () => (SftpClient)await ConnectAsync(root, host, false), downloadWorkers, client);
                         }
                         else if (command.StartsWith("$upload ", StringComparison.OrdinalIgnoreCase))
                         {
@@ -791,8 +1044,15 @@ namespace AutoSSH
                 }
                 writer.Write("logout\n");
             }
+            Diag.End(loopOp, $"backup={BytesToString(backupSize)} upload={BytesToString(uploadSize)}");
             Console.WriteLine("{0} backed up {1}                      ", host, BytesToString(backupSize));
             Console.WriteLine("{0} uploaded {1}                      ", host, BytesToString(uploadSize));
+            }
+            catch (Exception ex)
+            {
+                Diag.Fail(loopOp, ex);
+                throw;
+            }
         }
 
         public static async Task Main(string[] args)
@@ -803,17 +1063,29 @@ namespace AutoSSH
             }
 
             Console.WriteLine("Process started at {0}", DateTime.Now);
+            Diag.Start();
+            Console.WriteLine("Diagnostic log: {0}", Diag.Path);
             bytesDownloaded = 0;
             bytesUploaded = 0;
             bytesSkipped = 0;
             Stopwatch stopWatch = Stopwatch.StartNew();
+            try
+            {
             string commandFile = args.Length > 0 ? args[0] : null;
             string backupFolder = args.Length > 1 ? args[1] : null;
+            Diag.Write("commands=" + commandFile);
+            Diag.Write("backup=" + backupFolder);
             List<KeyValuePair<HostEntry, List<string>>> commands = Initialize(commandFile, backupFolder);
+            Diag.Write("loaded " + commands.Count + " hosts: " + string.Join(", ", commands.Select(kv => kv.Key.ToString())));
+            int heartbeatTicks = 0;
             using Timer updateTimer = new Timer(new TimerCallback((state) =>
             {
                 Console.Write("Bytes downloaded: {0}, uploaded: {1}, skipped: {2}    \r",
                     BytesToString(Interlocked.Read(ref bytesDownloaded)), BytesToString(Interlocked.Read(ref bytesUploaded)), BytesToString(Interlocked.Read(ref bytesSkipped)));
+                if (Interlocked.Increment(ref heartbeatTicks) % 20 == 0)
+                {
+                    Diag.Heartbeat();
+                }
             }));
 
             // 4x second update rate
@@ -821,26 +1093,48 @@ namespace AutoSSH
             using var hostGate = new SemaphoreSlim(hostWorkers);
             Task[] hostTasks = commands.Select(async kv =>
             {
+                Diag.Write($"{kv.Key} waiting for host slot");
                 await hostGate.WaitAsync();
+                Diag.Write($"{kv.Key} acquired host slot");
                 try
                 {
                     await ClientLoopAsync(backupFolder, kv.Key, kv.Value);
                 }
                 catch (Exception ex)
                 {
+                    Diag.Write($"{kv.Key} host error {ex}");
                     Console.WriteLine("Error on host {0}: {1}\r\n", kv.Key.Host, ex);
                 }
                 finally
                 {
+                    Diag.Write($"{kv.Key} released host slot");
                     hostGate.Release();
                 }
             }).ToArray();
-            await Task.WhenAll(hostTasks);
-            await updateTimer.DisposeAsync();
+            try
+            {
+                await Task.WhenAll(hostTasks);
+            }
+            finally
+            {
+                await updateTimer.DisposeAsync();
+            }
+            Diag.Heartbeat();
             Console.WriteLine("Bytes downloaded: {0}    ", BytesToString(bytesDownloaded));
             Console.WriteLine("Bytes uploaded: {0}   ", BytesToString(bytesUploaded));
             Console.WriteLine("Bytes skipped: {0}   ", BytesToString(bytesSkipped));
             Console.WriteLine("Process completed at {0}, total time: {1:0.00} minutes.", DateTime.Now, stopWatch.Elapsed.TotalMinutes);
+            Diag.Write($"totals down={BytesToString(bytesDownloaded)} up={BytesToString(bytesUploaded)} skip={BytesToString(bytesSkipped)} elapsed={stopWatch.Elapsed.TotalMinutes:0.00}m");
+            }
+            catch (Exception ex)
+            {
+                Diag.Write("fatal " + ex);
+                throw;
+            }
+            finally
+            {
+                Diag.Stop();
+            }
         }
     }
 }
