@@ -12,6 +12,7 @@ var tests = new (string Name, Action Run)[]
 {
     ("Recursive backups serialize SFTP requests and preserve sync/ignore behavior", BackupTree),
     ("Concurrent task downloads use independent bounded sessions and skip unchanged files without connections", ParallelBackup),
+    ("Downloads start before the directory scan finishes", OverlappingScanAndDownload),
     ("Concurrent task failures propagate and dispose worker sessions", ParallelBackupFailure),
     ("Failed and incomplete downloads preserve the previous backup", FailedDownload),
     ("Session failures escape every backup stage immediately", BackupSessionFailures),
@@ -133,6 +134,45 @@ static void ParallelBackup()
     Check(size == 32 * 8, "Wrong unchanged backup size.");
 }
 
+static FakeSftp NestedDownloadFixture()
+{
+    var remote = new FakeSftp();
+    remote.AddDirectory("/data");
+    for (int folder = 0; folder < 4; folder++)
+    {
+        string dir = "/data/folder" + folder;
+        remote.AddDirectory(dir);
+        for (int file = 0; file < 4; file++) remote.AddFile(dir + "/file" + file, "contents");
+    }
+    return remote;
+}
+
+static void OverlappingScanAndDownload()
+{
+    using var temp = new TempFolder();
+    var scanner = NestedDownloadFixture();
+    using var downloaded = new ManualResetEventSlim(false);
+    int listings = 0;
+    scanner.Before = method =>
+    {
+        if (method != "ListDirectory") return;
+        if (Interlocked.Increment(ref listings) >= 3)
+            Check(downloaded.Wait(TimeSpan.FromSeconds(5)), "Downloads did not overlap directory scanning.");
+    };
+    ISftpClient Connect()
+    {
+        var worker = NestedDownloadFixture();
+        worker.Before = method =>
+        {
+            if (method == "DownloadFile") downloaded.Set();
+        };
+        return worker.Client;
+    }
+    long size = BackupFolder(Host(), temp.Path, "/data", scanner.Client, TextWriter.Null, Connect, 2);
+    Check(size == 16 * 8, "Overlapping scan lost files.");
+    Check(downloaded.IsSet, "No files were downloaded.");
+}
+
 static void ParallelBackupFailure()
 {
     using var temp = new TempFolder();
@@ -247,6 +287,7 @@ static void ClientSettings()
     using var client = new SftpClient("localhost", "test", "test");
     AutoSSHApp.ConfigureClient(client);
     Check(client.OperationTimeout == TimeSpan.FromSeconds(1), "SFTP timeout override was not applied.");
+    Check(client.BufferSize == 65536, "SFTP buffer size missing.");
     Check(client.ConnectionInfo.Timeout == TimeSpan.FromSeconds(30), "Connection timeout missing.");
     Check(client.KeepAliveInterval == TimeSpan.FromSeconds(15), "Keepalive missing.");
 }
