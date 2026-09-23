@@ -7,6 +7,8 @@ namespace AutoSSH
         internal const int MaxDownloadWorkers = 16;
         internal const int MaxDownloadsPerConnection = 64;
         internal const int TransferBufferSize = 128 * 1024;
+        // Bytes in flight per TCP connection; SSH.NET's fixed default (134KB) caps a 175ms link near 0.75MB/s.
+        internal const int SocketBufferSize = 10 * 1024 * 1024;
         internal const uint SftpBufferSize = 64 * 1024;
 
         // Each host owns its clients. Small files cost several round trips each, so each download

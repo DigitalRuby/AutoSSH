@@ -27,6 +27,17 @@ static class IntegrationTests
             client.Connect();
             return client;
         }
+        using (var tuned = new SftpClient("127.0.0.1", port, "test", "test"))
+        {
+            SshConnector.Configure(tuned);
+            tuned.ConnectAsync(CancellationToken.None).GetAwaiter().GetResult();
+            int before = SshConnector.GetConnectedSocket(tuned).ReceiveBufferSize;
+            Require(SshConnector.TuneSocket(tuned), "Socket tuning could not reach SSH.NET's socket.");
+            int after = SshConnector.GetConnectedSocket(tuned).ReceiveBufferSize;
+            Console.WriteLine($"Socket receive buffer: SSH.NET default {before} bytes, tuned {after} bytes.");
+            Require(after == 10 * 1024 * 1024, "Socket receive buffer was not raised.");
+            Require(tuned.ListDirectory("/").Any(), "Tuned connection stopped working.");
+        }
         using var temp = new TempFolder();
         byte[] contents = Enumerable.Range(0, 300000).Select(i => (byte)(i % 251)).ToArray();
         string uploadDir = Path.Combine(temp.Path, "upload");

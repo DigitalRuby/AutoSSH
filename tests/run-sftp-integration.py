@@ -155,8 +155,11 @@ def run():
             thread = threading.Thread(target=serve, daemon=True)
             thread.start()
             try:
+                # AUTOSSH_TEST_EXE runs a prebuilt (e.g. native AOT) test executable instead of dotnet run.
+                test_exe = os.environ.get("AUTOSSH_TEST_EXE")
+                command = [test_exe] if test_exe else ["dotnet", "run", "--project", "tests/AutoSSH.RegressionTests", "-c", "Release", "--"]
                 result = subprocess.run(
-                    ["dotnet", "run", "--project", "tests/AutoSSH.RegressionTests", "-c", "Release", "--", "--integration-port", str(port)],
+                    command + ["--integration-port", str(port)],
                     cwd=REPO, timeout=60, capture_output=True, text=True,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )

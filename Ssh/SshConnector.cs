@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -28,6 +30,35 @@ namespace AutoSSH
             {
                 sftpClient.OperationTimeout = AppSettings.OperationTimeout;
                 sftpClient.BufferSize = AppSettings.SftpBufferSize;
+            }
+        }
+
+        // SSH.NET fixes the socket buffers after connecting, which disables Windows receive-window
+        // auto-tuning. There is no public hook, so reach its private socket.
+        [UnsafeAccessor(UnsafeAccessorKind.Method, Name = "get_Session")]
+        [return: UnsafeAccessorType("Renci.SshNet.ISession, Renci.SshNet")]
+        private static extern object GetSession(BaseClient client);
+
+        [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_socket")]
+        private static extern ref Socket GetSocket([UnsafeAccessorType("Renci.SshNet.Session, Renci.SshNet")] object session);
+
+        internal static Socket GetConnectedSocket(BaseClient client) => GetSocket(GetSession(client));
+
+        /// <summary>Raises the socket buffers of a connected client; returns false if SSH.NET internals changed.</summary>
+        internal static bool TuneSocket(BaseClient client)
+        {
+            try
+            {
+                Socket socket = GetConnectedSocket(client);
+                socket.ReceiveBufferSize = AppSettings.SocketBufferSize;
+                socket.SendBufferSize = AppSettings.SocketBufferSize;
+                return true;
+            }
+            catch (Exception ex) when (ex is MissingMemberException || ex is TypeLoadException ||
+                ex is InvalidCastException || ex is NullReferenceException || ex is SocketException)
+            {
+                DiagnosticLog.Write($"socket buffer tuning unavailable {ex.GetType().Name}: {ex.Message}");
+                return false;
             }
         }
 
@@ -75,7 +106,9 @@ namespace AutoSSH
                 {
                     throw new SshConnectionException($"Failed to connect to {host}, finger match: {fingerMatch}");
                 }
-                DiagnosticLog.End(op, fingerMatch ? "ok" : "fingerprint-mismatch");
+                bool tuned = TuneSocket(client);
+                DiagnosticLog.End(op, (fingerMatch ? "ok" : "fingerprint-mismatch") +
+                    (tuned ? $" socketBuffer={ByteSize.Format(AppSettings.SocketBufferSize)}" : " socketBuffer=default"));
                 return client;
             }
             catch (Exception ex)
