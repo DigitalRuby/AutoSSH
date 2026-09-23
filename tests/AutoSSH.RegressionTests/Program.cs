@@ -1,4 +1,3 @@
-using System.Formats.Tar;
 using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -13,12 +12,13 @@ var tests = new (string Name, Action Run)[]
 {
     ("Recursive backups serialize SFTP requests and preserve sync/ignore behavior", BackupTree),
     ("Concurrent task downloads use independent bounded sessions and skip unchanged files without connections", ParallelBackup),
+    ("Each download connection carries several concurrent downloads and opens once", PipelinedConnections),
     ("Downloads start before the directory scan finishes", OverlappingScanAndDownload),
     ("Concurrent task failures propagate and dispose worker sessions", ParallelBackupFailure),
     ("Failed and incomplete downloads preserve the previous backup", FailedDownload),
     ("Downloads that grew after listing still commit the complete file", GrewAfterListing),
     ("Downloads that shrank after listing still commit the complete file", ShrunkAfterListing),
-    ("Tar extracts listed files, skips extra members, and keeps grown sizes", TarExtract),
+    ("Timestamps compare at whole-second precision", SubSecondTimestamps),
     ("Session failures escape every backup stage immediately", BackupSessionFailures),
     ("Uploads retain the remote root, create parents, and truncate existing files", UploadTree),
     ("Session failures escape every upload stage immediately", UploadSessionFailures),
@@ -50,21 +50,22 @@ static void Throws<T>(Action action) where T : Exception
     throw new InvalidOperationException("Expected " + typeof(T).Name);
 }
 
-static AutoSSHApp.HostEntry Host(string ignore = null) => new()
+static HostEntry Host(string ignore = null) => new()
 {
     Host = "test", Name = "test", IgnoreRegex = ignore == null ? null : new Regex(ignore)
 };
 
 static long BackupFile(string root, string path, ISftpClient client) =>
-    AutoSSHApp.BackupFileAsync(root, path, client).GetAwaiter().GetResult();
+    BackupService.BackupFileAsync(root, path, client).GetAwaiter().GetResult();
 
-static long BackupFolder(AutoSSHApp.HostEntry host, string root, string path, ISftpClient client,
-    TextWriter log, Func<ISftpClient> createClient = null, int workers = 4) =>
-    AutoSSHApp.BackupFolderAsync(host, root, path, client, log,
-        createClient == null ? null : () => Task.FromResult(createClient()), workers).GetAwaiter().GetResult();
+static long BackupFolder(HostEntry host, string root, string path, ISftpClient client,
+    TextWriter log, Func<ISftpClient> createClient = null, int workers = 4, int perConnection = 1) =>
+    BackupService.BackupFolderAsync(host, root, path, client, log,
+        createClient == null ? null : () => Task.FromResult(createClient()), workers,
+        downloadsPerConnection: perConnection).GetAwaiter().GetResult();
 
-static long UploadFolder(AutoSSHApp.HostEntry host, string path, ISftpClient client, TextWriter log) =>
-    AutoSSHApp.UploadFolderAsync(host, path, client, log).GetAwaiter().GetResult();
+static long UploadFolder(HostEntry host, string path, ISftpClient client, TextWriter log) =>
+    UploadService.UploadFolderAsync(host, path, client, log).GetAwaiter().GetResult();
 
 static void BackupTree()
 {
@@ -136,6 +137,36 @@ static void ParallelBackup()
     size = BackupFolder(Host(), temp.Path, "/data", scanner.Client, TextWriter.Null,
         () => throw new InvalidOperationException("Unchanged sync opened a download connection."), 3);
     Check(size == 32 * 8, "Wrong unchanged backup size.");
+}
+
+static void PipelinedConnections()
+{
+    using var temp = new TempFolder();
+    var scanner = DownloadFixture();
+    var clients = new System.Collections.Concurrent.ConcurrentBag<FakeSftp>();
+    using var overlap = new CountdownEvent(8);
+    int started = 0;
+    int connects = 0;
+    ISftpClient Connect()
+    {
+        Interlocked.Increment(ref connects);
+        var worker = DownloadFixture();
+        worker.Before = method =>
+        {
+            if (method == "DownloadFile" && Interlocked.Increment(ref started) <= 8)
+            {
+                overlap.Signal();
+                Check(overlap.Wait(TimeSpan.FromSeconds(5)), "Downloads did not share connections concurrently.");
+            }
+        };
+        clients.Add(worker);
+        return worker.Client;
+    }
+    long size = BackupFolder(Host(), temp.Path, "/data", scanner.Client, TextWriter.Null, Connect, 2, 4);
+    Check(size == 32 * 8, "Pipelined backup lost files.");
+    Check(connects == 2 && clients.Sum(c => c.Downloads) == 32, "Wrong connection count or download count.");
+    Check(clients.All(c => c.Disposals == 1), "Shared connection leaked or was disposed twice.");
+    Check(Directory.GetFiles(temp.Path, "*", SearchOption.AllDirectories).All(f => File.ReadAllText(f) == "contents"), "Pipelined backup corrupted files.");
 }
 
 static FakeSftp NestedDownloadFixture()
@@ -246,39 +277,16 @@ static void ShrunkAfterListing()
     Check(File.ReadAllText(System.IO.Path.Combine(temp.Path, "data/live.json")) == "0123456789", "Shrunk file was discarded.");
 }
 
-static void TarExtract()
+static void SubSecondTimestamps()
 {
-    Check(AutoSSHApp.NormalizeTarEntryName("opt/app/file.txt") == "/opt/app/file.txt", "Relative tar names should map to remote paths.");
-    Check(AutoSSHApp.NormalizeTarEntryName("/opt/app/file.txt") == "/opt/app/file.txt", "Absolute tar names should stay absolute.");
-    Check(AutoSSHApp.NormalizeTarEntryName("./opt/app/file.txt") == "/opt/app/file.txt", "Tar ./ prefixes should be stripped.");
     using var temp = new TempFolder();
-    var timestamp = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-    var listed = new AutoSSHApp.BackupEntry("/opt/app/file.txt", "file.txt", true, false, 3, timestamp);
-    var files = new Dictionary<string, AutoSSHApp.BackupEntry> { [listed.FullName] = listed };
-    var remaining = new HashSet<string> { listed.FullName };
-    using var tar = new MemoryStream();
-    using (var writer = new TarWriter(tar, leaveOpen: true))
-    {
-        var wanted = new PaxTarEntry(TarEntryType.RegularFile, "opt/app/file.txt")
-        {
-            DataStream = new MemoryStream("hello world"u8.ToArray()),
-            ModificationTime = timestamp
-        };
-        writer.WriteEntry(wanted);
-        var extra = new PaxTarEntry(TarEntryType.RegularFile, "etc/passwd")
-        {
-            DataStream = new MemoryStream("secret"u8.ToArray())
-        };
-        writer.WriteEntry(extra);
-    }
-    tar.Position = 0;
-    long bytes = AutoSSHApp.ExtractTarBackupAsync(temp.Path, files, remaining, tar).GetAwaiter().GetResult();
-    Check(bytes == 11, "Grew tar file was rejected as incomplete.");
-    Check(remaining.Count == 0, "Listed tar file was not marked extracted.");
-    string local = System.IO.Path.Combine(temp.Path, "opt/app/file.txt");
-    Check(File.ReadAllText(local) == "hello world", "Tar extract wrote the wrong contents.");
-    Check(File.GetLastWriteTimeUtc(local) == timestamp, "Tar extract did not restore the listed timestamp.");
-    Check(!File.Exists(System.IO.Path.Combine(temp.Path, "etc/passwd")), "Unlisted tar member was extracted.");
+    string local = System.IO.Path.Combine(temp.Path, "file");
+    File.WriteAllText(local, "backup");
+    var stored = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
+    File.SetLastWriteTimeUtc(local, stored);
+    Check(LocalFiles.IsUpToDate(local, stored.AddMilliseconds(750)), "Sub-second remote time forced a re-download.");
+    Check(!LocalFiles.IsUpToDate(local, stored.AddSeconds(1)), "Newer remote file was skipped.");
+    Check(!LocalFiles.IsUpToDate(System.IO.Path.Combine(temp.Path, "missing"), stored), "Missing local file was skipped.");
 }
 
 static void BackupSessionFailures()
@@ -338,7 +346,7 @@ static void UploadSessionFailures()
 static void Progress()
 {
     long count = 0;
-    var progress = new AutoSSHApp.TransferProgress(delta => Interlocked.Add(ref count, delta));
+    var progress = new TransferProgress(delta => Interlocked.Add(ref count, delta));
     Parallel.For(0, 10000, i => progress.Report((ulong)(10000 - i)));
     progress.Report(10000);
     progress.Report(1);
@@ -348,7 +356,7 @@ static void Progress()
 static void ClientSettings()
 {
     using var client = new SftpClient("localhost", "test", "test");
-    AutoSSHApp.ConfigureClient(client);
+    SshConnector.Configure(client);
     Check(client.OperationTimeout == TimeSpan.FromSeconds(1), "SFTP timeout override was not applied.");
     Check(client.BufferSize == 65536, "SFTP buffer size missing.");
     Check(client.ConnectionInfo.Timeout == TimeSpan.FromSeconds(30), "Connection timeout missing.");

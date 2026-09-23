@@ -6,23 +6,24 @@ using Renci.SshNet.Common;
 static class IntegrationTests
 {
     static long BackupFile(string root, string path, ISftpClient client) =>
-        AutoSSHApp.BackupFileAsync(root, path, client).GetAwaiter().GetResult();
+        BackupService.BackupFileAsync(root, path, client).GetAwaiter().GetResult();
 
-    static long BackupFolder(AutoSSHApp.HostEntry host, string root, string path, ISftpClient client,
-        TextWriter log, Func<ISftpClient> createClient = null, int workers = 4) =>
-        AutoSSHApp.BackupFolderAsync(host, root, path, client, log,
-            createClient == null ? null : () => Task.FromResult(createClient()), workers).GetAwaiter().GetResult();
+    static long BackupFolder(HostEntry host, string root, string path, ISftpClient client,
+        TextWriter log, Func<ISftpClient> createClient = null, int workers = 4, int perConnection = 1) =>
+        BackupService.BackupFolderAsync(host, root, path, client, log,
+            createClient == null ? null : () => Task.FromResult(createClient()), workers,
+            downloadsPerConnection: perConnection).GetAwaiter().GetResult();
 
-    static long UploadFolder(AutoSSHApp.HostEntry host, string path, ISftpClient client, TextWriter log) =>
-        AutoSSHApp.UploadFolderAsync(host, path, client, log).GetAwaiter().GetResult();
+    static long UploadFolder(HostEntry host, string path, ISftpClient client, TextWriter log) =>
+        UploadService.UploadFolderAsync(host, path, client, log).GetAwaiter().GetResult();
 
     internal static void Run(int port)
     {
-        var host = new AutoSSHApp.HostEntry { Host = "127.0.0.1", Name = "test" };
+        var host = new HostEntry { Host = "127.0.0.1", Name = "test" };
         SftpClient Connect()
         {
             var client = new SftpClient("127.0.0.1", port, "test", "test");
-            AutoSSHApp.ConfigureClient(client);
+            SshConnector.Configure(client);
             client.Connect();
             return client;
         }
@@ -58,6 +59,14 @@ static class IntegrationTests
             long skippedSize = BackupFolder(host, backupDir, "/parallel", client, Console.Out,
                 () => throw new InvalidOperationException("Unchanged backup opened a worker connection."), 4);
             Require(skippedSize == parallelSize, "Unchanged parallel backup size mismatch.");
+            string pipelinedDir = Path.Combine(temp.Path, "pipelined");
+            transferTimer.Restart();
+            long pipelinedSize = BackupFolder(host, pipelinedDir, "/parallel", client, Console.Out, Connect, 2, 8);
+            double pipelinedMs = transferTimer.Elapsed.TotalMilliseconds;
+            Require(pipelinedSize == parallelSize, "Pipelined backup byte count mismatch.");
+            for (int i = 0; i < 24; i++)
+                Require(File.ReadAllBytes(Path.Combine(pipelinedDir, "parallel/file" + i)).SequenceEqual(contents[..8192]), "Pipelined download corrupted data.");
+            Console.WriteLine($"Local 24-file download: two connections x8 {pipelinedMs:F0} ms.");
             Console.WriteLine($"Local 24-file download: sequential {sequentialMs:F0} ms, four workers {parallelMs:F0} ms (includes worker connections).");
         }
         using (var client = Connect())
@@ -95,22 +104,22 @@ static class IntegrationTests
             Require(watch.Elapsed < TimeSpan.FromSeconds(5), "Upload timeout took too long.");
         }
         using var ssh = new SshClient("127.0.0.1", port, "test", "test");
-        AutoSSHApp.ConfigureClient(ssh);
+        SshConnector.Configure(ssh);
         ssh.Connect();
         using var shell = ssh.CreateShellStream("xterm", 80, 24, 800, 600, 1024);
         using var log = new StringWriter();
-        AutoSSHApp.ExpectPrompt(shell, AutoSSHApp.loginPromptRegex, TimeSpan.FromSeconds(1), log, "login");
+        ShellPrompt.Expect(shell, ShellPrompt.Login, TimeSpan.FromSeconds(1), log, "login");
         shell.Write("sudo -s\n");
-        string sudo = AutoSSHApp.ExpectPrompt(shell, AutoSSHApp.sudoPromptRegex, TimeSpan.FromSeconds(1), log, "sudo");
-        Require(AutoSSHApp.rootPromptRegex.IsMatch(sudo), "Passwordless sudo was not recognized.");
+        string sudo = ShellPrompt.Expect(shell, ShellPrompt.Sudo, TimeSpan.FromSeconds(1), log, "sudo");
+        Require(ShellPrompt.Root.IsMatch(sudo), "Passwordless sudo was not recognized.");
         shell.Write("echo test\n");
-        AutoSSHApp.ExpectPrompt(shell, AutoSSHApp.rootPromptRegex, TimeSpan.FromSeconds(1), log, "command");
+        ShellPrompt.Expect(shell, ShellPrompt.Root, TimeSpan.FromSeconds(1), log, "command");
         Require(log.ToString().Contains("test output"), "Command output missing from log.");
         shell.Write("stall\n");
         var timer = Stopwatch.StartNew();
         try
         {
-            AutoSSHApp.ExpectPrompt(shell, AutoSSHApp.rootPromptRegex, TimeSpan.FromMilliseconds(200), log, "stalled command");
+            ShellPrompt.Expect(shell, ShellPrompt.Root, TimeSpan.FromMilliseconds(200), log, "stalled command");
             throw new InvalidOperationException("Shell prompt did not time out.");
         }
         catch (TimeoutException) { }
